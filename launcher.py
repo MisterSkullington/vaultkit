@@ -2,6 +2,7 @@
 """Start vaultkit: install a verified, staged update first (if there is one), then open the app.
 
   pyw -3.13 launcher.py               normal start (what "Open vaultkit.cmd" runs)
+  pyw -3.13 launcher.py --tray        start hidden in the tray (Start with Windows uses this)
   py  -3.13 launcher.py --rollback    go back to the previous version and don't reinstall this one
 """
 from __future__ import annotations
@@ -36,7 +37,7 @@ def main() -> int:
         note = f"An update wasn't installed: {e}. You're still on the previous version."
 
     import app
-    return app.main(startup_note=note)
+    return app.main(startup_note=note, start_hidden="--tray" in sys.argv)
 
 
 if __name__ == "__main__":

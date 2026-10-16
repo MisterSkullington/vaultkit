@@ -23,11 +23,12 @@ app.py              the desktop app (PySide6)
 launcher.py         starts the app; installs a verified update first if one is waiting
 Open vaultkit.cmd   double-click to open the app (runs launcher.py)
 updater.py          signed self-updates from your GitHub repo's releases
+autostart.py        "Start with Windows" (per-user Run key, no admin rights)
 tools/release.py    signs and publishes a release (run on your PC; the key stays there)
 vaultkit.py         the command-line tool (same core the app uses)
 vaultkit.cmd        lets you type `vaultkit ...` instead of `py vaultkit.py ...`
 secretstore.py      optional saved password for unattended checks (Windows DPAPI)
-tests/              46 tests, incl. headless GUI tests against a fake keepassxc-cli
+tests/              58 tests, incl. headless GUI tests against a fake keepassxc-cli
 ```
 
 Needs: Windows 10/11, KeePassXC (with `C:\Program Files\KeePassXC` on PATH), Python 3.10+. The app needs **64-bit** Python (PySide6 has no 32-bit Windows build); the launcher uses `pyw -3.13`.
@@ -50,6 +51,18 @@ Then double-click **Open vaultkit.cmd**. Pin it to Start for quick access (right
 - **Auto-lock:** after 5 minutes with no mouse or keyboard activity, the password is dropped
   and you're back at the unlock screen.
 - **Remember on this PC for daily checks:** optional. See *Saved password* below.
+- **Tray:** closing the window locks the vault and keeps vaultkit by the clock. Right-click
+  the icon for *Open*, *Check now*, *Daily check*, *Start with Windows*, *Theme* and *Quit*.
+  The icon gets a red dot when a password is breached, amber when some need changing.
+- **Daily check:** runs once a day in the background. With *Remember on this PC* it runs on
+  its own; otherwise you get one reminder a day to unlock. You're notified when a password is
+  **newly** found in a breach, and reminded weekly while problems remain. Notifications never
+  name sites, because Windows can show them on the lock screen.
+- **Start with Windows:** tick it in the tray menu. It starts quietly in the tray (no window)
+  and replaces the older `vaultkit check` Startup shortcut, which it removes.
+- **Themes:** *Theme* (top right, or in the tray menu): Match Windows (default), Mist,
+  Slate (dark), Ember (dark, warm), Heather, High contrast. All meet WCAG AA contrast.
+- Opening vaultkit while it's already running just brings the existing window forward.
 - **Fix passwords:** walks through every breached or reused entry, one site at a time
   (double-click a row to fix just that one):
   1. a new password is made and **saved in your vault first**, then copied for 45 s
@@ -77,7 +90,7 @@ Then double-click **Open vaultkit.cmd**. Pin it to Start for quick access (right
 | `vaultkit rotate list` | Rotations started but not finished |
 | `vaultkit remember` / `vaultkit forget` | Save / delete the master password for unattended checks |
 | `vaultkit shred FILE` | Overwrite and delete an exported CSV |
-| `vaultkit --version` | Should say 1.5.0 |
+| `vaultkit --version` | Should say 1.6.0 |
 
 `vaultkit` works from any PowerShell window once this folder is on your PATH (one time):
 ```powershell
@@ -112,12 +125,8 @@ Windows DPAPI, tied to your Windows login on this PC. Another user or a copied d
 read it; programs running as you while you're logged in can. That's the trade-off for
 checks that run while you're away. `vaultkit forget` deletes it.
 
-Daily check at log-on, using the saved password. A Startup-folder shortcut needs no admin
-rights (a `schtasks /sc onlogon` task does). Run once in PowerShell:
-```powershell
-$s = (New-Object -ComObject WScript.Shell).CreateShortcut("$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\vaultkit check.lnk"); $s.TargetPath = "cmd.exe"; $s.Arguments = "/k py $env:USERPROFILE\vaultkit\app\vaultkit.py --use-saved-password check"; $s.Save()
-```
-Remove it by deleting `vaultkit check.lnk` from the Startup folder (Win+R → `shell:startup`).
+Daily checks are run by the app from the tray (see *Tray* above). Turn on *Start with
+Windows* in the tray menu so they happen without opening anything.
 
 ## Updates
 

@@ -9,94 +9,163 @@ Run on Windows without a console window:  pyw app.py
 """
 from __future__ import annotations
 
+import getpass
+import json
 import os
 import subprocess
 import sys
 import urllib.error
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
 from PySide6.QtCore import (QEvent, QMimeData, QObject, QRectF, QRunnable, QSettings,
                             QSize, Qt, QThreadPool, QTimer, QUrl, Signal)
-from PySide6.QtGui import (QColor, QDesktopServices, QIcon, QIntValidator, QPainter,
-                           QPainterPath,
+from PySide6.QtGui import (QAction, QActionGroup, QColor, QDesktopServices, QIcon, QIntValidator,
+                           QPainter, QPainterPath,
                            QPalette, QPixmap)
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox,
                                QFileDialog, QFormLayout,
-                               QScrollArea,
+                               QMenu, QScrollArea, QSystemTrayIcon,
                                QHBoxLayout, QHeaderView, QLabel, QLineEdit,
                                QMainWindow, QPushButton, QSizePolicy, QStackedWidget,
                                QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import autostart  # noqa: E402
 import secretstore  # noqa: E402
 import updater  # noqa: E402
 import vaultkit as vk  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 UPDATE_CHECK_HOURS = 24
+DAILY_CHECK_HOURS = 24     # how often the background check runs
+REMINDER_DAYS = 7          # nudge about unfixed problems at most this often
+INSTANCE_NAME = f"vaultkit-{getpass.getuser()}"
 
 IDLE_LOCK_MINUTES = 5
 
 # ---------------------------------------------------------------------------- design tokens
-PAPER = "#EEF1F4"     # cool mist: window background
-SURFACE = "#FFFFFF"   # inputs, table
-INK = "#1C2733"       # deep slate text
-MUTED = "#5B6B7A"     # secondary text
-LINE = "#D5DCE3"      # hairlines
-BREACHED = "#B3261E"  # brick red: found in breaches
-REUSED = "#B7791F"    # ochre: same password elsewhere
-SAMENAME = "#5A5FA8"  # indigo: ambiguous title (can't be fixed automatically)
-SAFE = "#2E7D5B"      # pine: nothing found
-FOCUS = "#2F5D8A"     # keyboard focus ring / primary button
+@dataclass(frozen=True)
+class Theme:
+    key: str
+    label: str
+    dark: bool
+    paper: str        # window background
+    surface: str      # inputs, table, panels
+    ink: str          # text
+    muted: str        # secondary text
+    line: str         # hairlines
+    focus: str        # focus ring, links, primary button
+    focus_hover: str
+    on_focus: str     # text on the primary button
+    disabled: str     # disabled primary button
+    selection: str    # selected table row, info banner
+    warn_bg: str      # warning banner
+    breached: str
+    reused: str
+    samename: str
+    safe: str
+
+
+# Every theme is checked for 4.5:1 text contrast and 3:1 for status colours (WCAG AA).
+THEMES = {t.key: t for t in (
+    Theme("mist", "Mist (light)", False,
+          paper="#EEF1F4", surface="#FFFFFF", ink="#1C2733", muted="#56657A", line="#D5DCE3",
+          focus="#2F5D8A", focus_hover="#264D73", on_focus="#FFFFFF", disabled="#9FB3C8",
+          selection="#DCE6F0", warn_bg="#F6E3E1",
+          breached="#B3261E", reused="#A8701C", samename="#5A5FA8", safe="#2E7D5B"),
+    Theme("slate", "Slate (dark)", True,
+          paper="#161D24", surface="#1E2731", ink="#E3E9EF", muted="#9AA8B6", line="#2F3B47",
+          focus="#7DAEDB", focus_hover="#96BFE4", on_focus="#0E1620", disabled="#3A4856",
+          selection="#2A3B4D", warn_bg="#43252A",
+          breached="#EF6B5F", reused="#E2A445", samename="#9A9EEA", safe="#52B98A"),
+    Theme("ember", "Ember (dark, warm)", True,
+          paper="#1A1416", surface="#241B1E", ink="#F2E6E3", muted="#B9A29E", line="#3A2C30",
+          focus="#E8945A", focus_hover="#F0A876", on_focus="#1A1416", disabled="#5A4440",
+          selection="#3A2A2C", warn_bg="#4A2228",
+          breached="#FF6577", reused="#F2C14E", samename="#B39DF0", safe="#6CC79A"),
+    Theme("heather", "Heather (light)", False,
+          paper="#F1EEF3", surface="#FFFFFF", ink="#2A2230", muted="#62566A", line="#DDD5E2",
+          focus="#6B4C8A", focus_hover="#5A3E75", on_focus="#FFFFFF", disabled="#BCAFC7",
+          selection="#E6DDEE", warn_bg="#F6E2E4",
+          breached="#B3261E", reused="#9A6210", samename="#3F6FB0", safe="#2E7D5B"),
+    Theme("contrast", "High contrast", True,
+          paper="#000000", surface="#000000", ink="#FFFFFF", muted="#E0E0E0", line="#FFFFFF",
+          focus="#FFD400", focus_hover="#FFE45C", on_focus="#000000", disabled="#555555",
+          selection="#33330A", warn_bg="#3A0000",
+          breached="#FF7070", reused="#FFB000", samename="#A9B1FF", safe="#3DDC84"),
+)}
+THEME_CHOICES = [("system", "Match Windows")] + [(k, t.label) for k, t in THEMES.items()]
+T: Theme = THEMES["mist"]  # the active theme; everything reads colours from here
+
+# The app/tray icon is a brand mark: same colours in every theme.
+ICON_TILE, ICON_BAR = "#1C2733", "#EEF1F4"
+ICON_DOT = {"bad": "#D9372B", "warn": "#E2A445", "ok": "#3FA672"}
 
 FAMILY = "Segoe UI Variable Text"
 DISPLAY = "Segoe UI Variable Display"
 
-STYLE = f"""
-QWidget {{ color: {INK}; font-family: "{FAMILY}", "Segoe UI", sans-serif; font-size: 10pt; }}
-QMainWindow, #page {{ background: {PAPER}; }}
-QLabel#muted {{ color: {MUTED}; }}
+def build_style(t: Theme) -> str:
+    return f"""
+QWidget {{ color: {t.ink}; font-family: "{FAMILY}", "Segoe UI", sans-serif; font-size: 10pt; }}
+QMainWindow, #page {{ background: {t.paper}; }}
+QLabel#muted {{ color: {t.muted}; }}
 QLabel#title {{ font-family: "{DISPLAY}", "Segoe UI", sans-serif; font-size: 20pt;
                 font-weight: 600; }}
 QLabel#verdict {{ font-family: "{DISPLAY}", "Segoe UI", sans-serif; font-size: 28pt;
                   font-weight: 600; }}
-QLabel#error {{ color: {BREACHED}; }}
-QLineEdit {{ background: {SURFACE}; border: 1px solid {LINE}; border-radius: 6px;
-             padding: 7px 9px; selection-background-color: {FOCUS}; }}
-QLineEdit:focus {{ border: 2px solid {FOCUS}; padding: 6px 8px; }}
-QPushButton {{ background: {SURFACE}; border: 1px solid {LINE}; border-radius: 6px;
+QLabel#error {{ color: {t.breached}; }}
+QLineEdit {{ background: {t.surface}; border: 1px solid {t.line}; border-radius: 6px;
+             padding: 7px 9px; selection-background-color: {t.focus}; }}
+QLineEdit:focus {{ border: 2px solid {t.focus}; padding: 6px 8px; }}
+QPushButton {{ background: {t.surface}; border: 1px solid {t.line}; border-radius: 6px;
                padding: 7px 14px; }}
-QPushButton:hover {{ border-color: {MUTED}; }}
-QPushButton:focus {{ border: 2px solid {FOCUS}; padding: 6px 13px; }}
-QPushButton:disabled {{ color: {MUTED}; background: {PAPER}; }}
-QPushButton#primary {{ background: {FOCUS}; color: white; border: 1px solid {FOCUS}; }}
-QPushButton#primary:hover {{ background: #264D73; }}
-QPushButton#primary:focus {{ border: 2px solid {INK}; }}
-QPushButton#primary:disabled {{ background: #9FB3C8; border-color: #9FB3C8; }}
-QPushButton#link {{ background: transparent; border: none; color: {FOCUS}; padding: 2px 0;
+QPushButton:hover {{ border-color: {t.muted}; }}
+QPushButton:focus {{ border: 2px solid {t.focus}; padding: 6px 13px; }}
+QPushButton:disabled {{ color: {t.muted}; background: {t.paper}; }}
+QPushButton#primary {{ background: {t.focus}; color: {t.on_focus}; border: 1px solid {t.focus}; }}
+QPushButton#primary:hover {{ background: {t.focus_hover}; }}
+QPushButton#primary:focus {{ border: 2px solid {t.ink}; }}
+QPushButton#primary:hover:focus {{ background: {t.focus_hover}; }}
+QPushButton#primary:disabled {{ background: {t.disabled}; border-color: {t.disabled}; }}
+QPushButton#link {{ background: transparent; border: none; color: {t.focus}; padding: 2px 0;
                     text-align: left; }}
 QPushButton#link:hover {{ text-decoration: underline; }}
 QPushButton#link:focus {{ border: none; text-decoration: underline; }}
-QTableWidget {{ background: {SURFACE}; border: 1px solid {LINE}; border-radius: 6px;
-                gridline-color: transparent; selection-background-color: #DCE6F0;
-                selection-color: {INK}; }}
+QPushButton#link::menu-indicator {{ image: none; width: 0; }}
+QTableWidget {{ background: {t.surface}; border: 1px solid {t.line}; border-radius: 6px;
+                gridline-color: transparent; selection-background-color: {t.selection};
+                selection-color: {t.ink}; }}
 QTableWidget {{ outline: 0; }}
-QTableWidget:focus {{ border: 2px solid {FOCUS}; }}
-QTableWidget::item {{ padding: 6px 8px; border-bottom: 1px solid {PAPER}; }}
-QTableWidget::item:focus {{ border: none; border-bottom: 1px solid {PAPER}; }}
-QHeaderView::section {{ background: {SURFACE}; color: {MUTED}; border: none;
-                        border-bottom: 1px solid {LINE}; padding: 8px; font-weight: 600; }}
+QTableWidget:focus {{ border: 2px solid {t.focus}; }}
+QTableWidget::item {{ padding: 6px 8px; border-bottom: 1px solid {t.paper}; }}
+QTableWidget::item:focus {{ border: none; border-bottom: 1px solid {t.paper}; }}
+QHeaderView::section {{ background: {t.surface}; color: {t.muted}; border: none;
+                        border-bottom: 1px solid {t.line}; padding: 8px; font-weight: 600; }}
 QCheckBox {{ spacing: 8px; }}
+QCheckBox::indicator {{ width: 15px; height: 15px; border: 1px solid {t.muted};
+                        border-radius: 3px; background: {t.surface}; }}
+QCheckBox::indicator:checked {{ background: {t.focus}; border-color: {t.focus}; }}
+QCheckBox::indicator:focus {{ border: 2px solid {t.focus}; }}
+QCheckBox::indicator:disabled {{ border-color: {t.line}; background: {t.paper}; }}
 QLabel#step {{ font-weight: 600; }}
-QWidget#banner {{ background: #DCE6F0; border-bottom: 1px solid {LINE}; }}
-QWidget#banner[warn="true"] {{ background: #F6E3E1; }}
-QLabel#ok {{ color: {SAFE}; }}
+QWidget#banner {{ background: {t.selection}; border-bottom: 1px solid {t.line}; }}
+QWidget#banner[warn="true"] {{ background: {t.warn_bg}; }}
+QLabel#ok {{ color: {t.safe}; }}
 QLineEdit#secret {{ font-family: "Cascadia Mono", "Consolas", monospace; font-size: 11pt; }}
-QWidget#rules {{ background: {SURFACE}; border: 1px solid {LINE}; border-radius: 6px; }}
-QScrollArea#scroll, QWidget#scrollbody {{ background: {PAPER}; border: none; }}
+QWidget#rules {{ background: {t.surface}; border: 1px solid {t.line}; border-radius: 6px; }}
+QScrollArea#scroll, QWidget#scrollbody {{ background: {t.paper}; border: none; }}
+QMenu {{ background: {t.surface}; border: 1px solid {t.line}; padding: 4px; }}
+QMenu::item {{ padding: 6px 18px; }}
+QMenu::item:selected {{ background: {t.selection}; color: {t.ink}; }}
+QComboBox {{ background: {t.surface}; }}
+QComboBox QAbstractItemView {{ background: {t.surface}; color: {t.ink};
+                               selection-background-color: {t.selection}; }}
+QToolTip {{ background: {t.surface}; color: {t.ink}; border: 1px solid {t.line}; }}
 """
 
 
@@ -146,6 +215,79 @@ class SecretClipboard(QObject):
             cb.clear()
         self._value = None
         self._timer.stop()
+
+
+def make_icon(status: str | None = None) -> QIcon:
+    """Slate tile with the vault bar; a status dot when there's news (bad / warn / ok)."""
+    icon = QIcon()
+    dot = ICON_DOT.get(status or "")
+    for size in (16, 20, 24, 32, 48, 64, 256):
+        pm = QPixmap(size, size)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(ICON_TILE))
+        p.drawRoundedRect(QRectF(0, 0, size, size), size * 0.2, size * 0.2)
+        bar_y, bar_h = size * 0.40, max(size * 0.18, 2.0)
+        x, gap = size * 0.16, max(size * 0.04, 1.0)
+        for frac, alpha in ((0.17, 255), (0.17, 200), (0.66, 150)):
+            w = size * 0.68 * frac
+            c = QColor(ICON_BAR)
+            c.setAlpha(alpha)
+            p.setBrush(c)
+            p.drawRoundedRect(QRectF(x, bar_y, w - gap, bar_h), bar_h / 3, bar_h / 3)
+            x += w
+        if dot:
+            r = size * 0.24
+            p.setBrush(QColor(ICON_BAR))
+            p.drawEllipse(QRectF(size - 2 * r - 1, size - 2 * r - 1, 2 * r + 1, 2 * r + 1))
+            p.setBrush(QColor(dot))
+            p.drawEllipse(QRectF(size - 2 * r + size * 0.04, size - 2 * r + size * 0.04,
+                                 2 * r - size * 0.1, 2 * r - size * 0.1))
+        p.end()
+        icon.addPixmap(pm)
+    return icon
+
+
+# ---------------------------------------------------------------------------- single instance
+def signal_running_instance(show: bool) -> bool:
+    """True if vaultkit is already running (and it was asked to show itself if `show`)."""
+    sock = QLocalSocket()
+    sock.connectToServer(INSTANCE_NAME)
+    if not sock.waitForConnected(500):
+        return False
+    sock.write(b"show" if show else b"ping")
+    sock.flush()
+    sock.waitForBytesWritten(500)
+    sock.disconnectFromServer()
+    return True
+
+
+class InstanceServer(QObject):
+    show_requested = Signal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.server = QLocalServer(self)
+        QLocalServer.removeServer(INSTANCE_NAME)  # stale socket after a crash (no-op on Windows)
+        self.server.listen(INSTANCE_NAME)
+        self.server.newConnection.connect(self._incoming)
+
+    def _incoming(self) -> None:
+        conn = self.server.nextPendingConnection()
+        if conn is None:
+            return
+        def read():
+            if bytes(conn.readAll()).startswith(b"show"):
+                self.show_requested.emit()
+            conn.disconnectFromServer()
+        conn.readyRead.connect(read)
+        if conn.bytesAvailable():
+            read()
+
+    def close(self) -> None:
+        self.server.close()
 
 
 # ---------------------------------------------------------------------------- background jobs
@@ -231,7 +373,7 @@ class Issue:
 
     @property
     def color(self) -> str:
-        return {"breached": BREACHED, "reused": REUSED, "samename": SAMENAME}[self.kind]
+        return {"breached": T.breached, "reused": T.reused, "samename": T.samename}[self.kind]
 
     @property
     def fixable(self) -> bool:
@@ -312,7 +454,7 @@ class HealthBar(QWidget):
 
     def set_report(self, r: Report | None) -> None:
         self.segments = [] if r is None else [
-            (r.breached, BREACHED), (r.reused, REUSED), (r.safe, SAFE)]
+            (r.breached, "breached"), (r.reused, "reused"), (r.safe, "safe")]
         if r:
             self.setAccessibleDescription(
                 f"{r.breached} breached, {r.reused} reused, {r.safe} safe")
@@ -325,7 +467,7 @@ class HealthBar(QWidget):
         clip = QPainterPath()
         clip.addRoundedRect(rect, 7, 7)
         p.setClipPath(clip)
-        p.fillRect(rect, QColor(LINE))
+        p.fillRect(rect, QColor(T.line))
         total = sum(n for n, _ in self.segments)
         if total:
             x, gap = rect.left(), 2.0
@@ -334,7 +476,7 @@ class HealthBar(QWidget):
                 w = rect.width() * n / total
                 seg = QRectF(x, rect.top(), max(w - (gap if i < len(visible) - 1 else 0), 3),
                              rect.height())
-                p.fillRect(seg, QColor(c))
+                p.fillRect(seg, QColor(getattr(T, c)))
                 x += w
         p.end()
 
@@ -358,18 +500,50 @@ class NumberField(QLineEdit):
         self.setText(str(n))
 
 
+class ThemeMenu(QMenu):
+    """The list of themes, with the current one ticked."""
+    chosen = Signal(str)
+
+    def __init__(self, title: str = "Theme") -> None:
+        super().__init__(title)
+        group = QActionGroup(self)
+        group.setExclusive(True)
+        self.actions_by_key: dict[str, QAction] = {}
+        for key, label in THEME_CHOICES:
+            act = QAction(label, self, checkable=True)
+            group.addAction(act)
+            self.addAction(act)
+            act.triggered.connect(lambda _checked=False, k=key: self.chosen.emit(k))
+            self.actions_by_key[key] = act
+
+    def sync(self, key: str) -> None:
+        self.actions_by_key.get(key, self.actions_by_key["system"]).setChecked(True)
+
+
+def theme_button(menu: ThemeMenu) -> QPushButton:
+    b = QPushButton("Theme \u25BE")
+    b.setObjectName("link")
+    b.setMenu(menu)
+    b.setAccessibleName("Choose a colour theme")
+    return b
+
+
 class LegendItem(QWidget):
-    def __init__(self, color: str, label: str) -> None:
+    def __init__(self, kind: str, label: str) -> None:
         super().__init__()
+        self.kind = kind
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(6)
-        dot = QLabel()
-        dot.setPixmap(swatch(color).pixmap(10, 10))
+        self.dot = dot = QLabel()
+        self.repaint_dot()
         self.text = QLabel(label)
         self.text.setObjectName("muted")
         lay.addWidget(dot)
         lay.addWidget(self.text)
+
+    def repaint_dot(self) -> None:
+        self.dot.setPixmap(swatch(getattr(T, self.kind)).pixmap(10, 10))
 
 
 # ---------------------------------------------------------------------------- pages
@@ -552,6 +726,7 @@ class UnlockPage(QWidget):
 class DashboardPage(QWidget):
     lock_requested = Signal()
     fix_requested = Signal(list)  # list[Issue]
+    checked = Signal(object)      # Report
 
     def __init__(self, runner: Runner) -> None:
         super().__init__()
@@ -580,6 +755,8 @@ class DashboardPage(QWidget):
         top.addWidget(self.lock_btn)
         top.addWidget(self.check_btn)
         top.addWidget(self.fix_btn)
+        top.setSpacing(8)
+        self.top_bar = top
         lay.addLayout(top)
         lay.addSpacing(26)
 
@@ -599,9 +776,9 @@ class DashboardPage(QWidget):
         lay.addSpacing(10)
         leg = QHBoxLayout()
         leg.setSpacing(18)
-        self.leg_breached = LegendItem(BREACHED, "")
-        self.leg_reused = LegendItem(REUSED, "")
-        self.leg_safe = LegendItem(SAFE, "")
+        self.leg_breached = LegendItem("breached", "")
+        self.leg_reused = LegendItem("reused", "")
+        self.leg_safe = LegendItem("safe", "")
         for w in (self.leg_breached, self.leg_reused, self.leg_safe):
             leg.addWidget(w)
         leg.addStretch(1)
@@ -687,6 +864,7 @@ class DashboardPage(QWidget):
             return
         self.show_report(r)
         (self.fix_btn if r.fixable else self.check_btn).setFocus()
+        self.checked.emit(r)
 
     def _check_failed(self, msg: str) -> None:
         self.check_btn.setEnabled(True)
@@ -883,6 +1061,7 @@ class FixPage(QWidget):
         self.reject_btn.clicked.connect(self.rejected)
         self.skip_btn = QPushButton("Skip for now")
         self.skip_btn.clicked.connect(self.skip)
+        row3.setSpacing(8)
         for b in (self.accept_btn, self.reject_btn, self.skip_btn):
             row3.addWidget(b)
         row3.addStretch(1)
@@ -1173,9 +1352,14 @@ class IdleWatcher(QObject):
 
 class MainWindow(QMainWindow):
     def __init__(self, idle_minutes: float = IDLE_LOCK_MINUTES, startup_note: str = "",
-                 check_updates: bool = True) -> None:
+                 check_updates: bool = True, background: bool = True) -> None:
         super().__init__()
         self.setWindowTitle("vaultkit")
+        self.setWindowIcon(make_icon())
+        self.quitting = False
+        self.instance: InstanceServer | None = None
+        self.theme_menus: list[ThemeMenu] = []
+        self.notifications: list[tuple[str, str]] = []  # what was shown (tests, and no-tray PCs)
         self.setMinimumSize(720, 560)
         self.settings = QSettings("vaultkit", "vaultkit")
         self.runner = Runner()
@@ -1190,6 +1374,19 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.fix)
         self.banner = Banner()
         self.banner.action.clicked.connect(self.restart)
+
+        # theme pickers: unlock screen (top right) and dashboard (top bar)
+        self.theme_key = self.settings.value("theme", "system")
+        unlock_menu, dash_menu = self.new_theme_menu(), self.new_theme_menu()
+        row = QHBoxLayout()
+        row.setContentsMargins(28, 16, 28, 0)
+        row.addStretch(1)
+        row.addWidget(theme_button(unlock_menu))
+        self.unlock.layout().insertLayout(0, row)
+        self.dash.top_bar.insertWidget(1, theme_button(dash_menu))
+        hints = QApplication.styleHints()
+        if hasattr(hints, "colorSchemeChanged"):
+            hints.colorSchemeChanged.connect(self._system_scheme_changed)
         central = QWidget()
         col = QVBoxLayout(central)
         col.setContentsMargins(0, 0, 0, 0)
@@ -1210,6 +1407,19 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(3000, self.check_updates)
             self.update_timer.start()
 
+        # tray + daily background check
+        self.known_breached = self._load_known_breached()
+        self.tray: QSystemTrayIcon | None = None
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self._build_tray()
+        self.daily = QTimer(self)
+        self.daily.setInterval(60 * 60 * 1000)  # look hourly; runs once it's due (survives sleep)
+        self.daily.timeout.connect(self.maybe_daily_check)
+        if background:
+            self.daily.start()
+            QTimer.singleShot(90_000, self.maybe_daily_check)
+        self.dash.checked.connect(lambda r: self.on_report(r, background=False))
+
         self.idle = QTimer(self)
         self.idle.setSingleShot(True)
         self.idle.setInterval(int(idle_minutes * 60_000))
@@ -1223,6 +1433,207 @@ class MainWindow(QMainWindow):
         self.dash.fix_requested.connect(self.on_fix)
         self.fix.finished.connect(self.on_fixed)
 
+    # -- themes
+    def new_theme_menu(self) -> ThemeMenu:
+        menu = ThemeMenu()
+        menu.sync(self.theme_key)
+        menu.chosen.connect(self.set_theme)
+        self.theme_menus.append(menu)
+        return menu
+
+    def set_theme(self, key: str) -> None:
+        self.theme_key = key
+        self.settings.setValue("theme", key)
+        apply_theme(QApplication.instance(), key)
+        self.refresh_theme()
+
+    def refresh_theme(self) -> None:
+        for m in self.theme_menus:
+            m.sync(self.theme_key)
+        for leg in (self.dash.leg_breached, self.dash.leg_reused, self.dash.leg_safe):
+            leg.repaint_dot()
+        if self.dash.report is not None:
+            self.dash.show_report(self.dash.report)  # re-colour the issue swatches
+        self.dash.bar.update()
+
+    def _system_scheme_changed(self, *_args) -> None:
+        if self.theme_key == "system":
+            self.set_theme("system")
+
+    # -- tray
+    def _build_tray(self) -> None:
+        self.tray = QSystemTrayIcon(make_icon(), self)
+        self.tray.setToolTip("vaultkit")
+        menu = QMenu()
+        open_act = menu.addAction("Open vaultkit")
+        open_act.triggered.connect(self.show_window)
+        check_act = menu.addAction("Check now")
+        check_act.triggered.connect(lambda: self.run_check(explicit=True))
+        menu.addSeparator()
+        self.daily_act = QAction("Daily check", menu, checkable=True)
+        self.daily_act.setChecked(self.daily_enabled)
+        self.daily_act.toggled.connect(lambda on: self.settings.setValue("daily_check", on))
+        menu.addAction(self.daily_act)
+        self.autostart_act = QAction("Start with Windows", menu, checkable=True)
+        self.autostart_act.setEnabled(autostart.supported())
+        self.autostart_act.setChecked(autostart.is_enabled())
+        self.autostart_act.toggled.connect(self.set_autostart)
+        menu.addAction(self.autostart_act)
+        menu.addMenu(self.new_theme_menu())
+        menu.addSeparator()
+        quit_act = menu.addAction("Quit vaultkit")
+        quit_act.triggered.connect(self.quit_app)
+        self.tray_menu = menu  # keep a reference: Qt doesn't own a context menu
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(self._tray_activated)
+        self.tray.messageClicked.connect(self.show_window)
+        self.tray.show()
+        autostart.refresh(HERE / "launcher.py")
+
+    def _tray_activated(self, reason) -> None:
+        if reason in (QSystemTrayIcon.ActivationReason.Trigger,
+                      QSystemTrayIcon.ActivationReason.DoubleClick):
+            self.show_window()
+
+    def set_autostart(self, on: bool) -> None:
+        if on:
+            autostart.enable(HERE / "launcher.py")
+        else:
+            autostart.disable()
+
+    def show_window(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def notify(self, title: str, body: str, warn: bool = False) -> None:
+        self.notifications.append((title, body))
+        if self.tray is not None:
+            icon = (QSystemTrayIcon.MessageIcon.Warning if warn
+                    else QSystemTrayIcon.MessageIcon.Information)
+            self.tray.showMessage(title, body, icon, 15_000)
+
+    def set_status(self, r: Report | None) -> None:
+        if self.tray is None:
+            return
+        if r is None:
+            self.tray.setIcon(make_icon())
+            self.tray.setToolTip("vaultkit")
+            return
+        status = "bad" if r.breached else ("warn" if r.needs_changing else "ok")
+        self.tray.setIcon(make_icon(status))
+        summary = (f"{r.needs_changing} need changing" if r.needs_changing
+                   else "all passwords look safe")
+        self.tray.setToolTip(f"vaultkit: {summary} (checked {r.checked_at:%a %H:%M})")
+
+    # -- daily check
+    @property
+    def daily_enabled(self) -> bool:
+        return self.settings.value("daily_check", True, type=bool)
+
+    def _when(self, key: str) -> datetime | None:
+        raw = self.settings.value(key, "")
+        try:
+            return datetime.fromisoformat(raw) if raw else None
+        except ValueError:
+            return None
+
+    def check_due(self) -> bool:
+        last = self._when("last_check_at")
+        return last is None or datetime.now() - last >= timedelta(hours=DAILY_CHECK_HOURS)
+
+    @staticmethod
+    def _load_known_breached() -> set[str]:
+        try:
+            data = json.loads((vk.state_dir() / "last-check.json").read_text("utf-8"))
+            return set(data.get("breached", {}))
+        except (OSError, ValueError):
+            return set()
+
+    def maybe_daily_check(self) -> None:
+        if self.daily_enabled and self.check_due():
+            self.run_check(explicit=False)
+
+    def run_check(self, explicit: bool) -> None:
+        """Explicit = the person asked (tray 'Check now'): always report the result."""
+        if self.dash.vault is not None and self.isVisible():
+            self.show_window() if explicit else None
+            self.dash.start_check()
+            return
+        if secretstore.supported() and secretstore.is_saved():
+            self.background_check(explicit)
+            return
+        if explicit:
+            self.show_window()
+            return
+        today = datetime.now().date().isoformat()
+        if self.settings.value("reminded_on", "") != today:
+            self.settings.setValue("reminded_on", today)
+            self.notify("Daily password check", "Open vaultkit and unlock it to run today's "
+                        "check. To run it automatically, tick 'Remember on this PC' when you "
+                        "unlock.")
+
+    def background_check(self, explicit: bool) -> None:
+        db = self.settings.value("db", "") or os.environ.get("VAULTKIT_DB", "")
+        if not db:
+            if explicit:
+                self.show_window()
+            return
+        v = vk.Vault(db=db, key_file=self.settings.value("key_file", "") or None,
+                     use_saved_password=True)
+
+        def work() -> Report:
+            try:
+                rows, hits, reuse, dupes, scanned = vk.scan(v)
+                vk.write_report(hits, reuse, dupes)
+                return build_report(rows, hits, reuse, dupes, scanned)
+            finally:
+                v.lock()  # the saved password is only in memory for the length of the check
+
+        self.runner.submit(work, lambda r: self.on_report(r, background=True, explicit=explicit),
+                           lambda m: self._background_failed(m, explicit))
+
+    def on_report(self, r: Report, background: bool, explicit: bool = False) -> None:
+        self.settings.setValue("last_check_at", datetime.now().isoformat(timespec="seconds"))
+        self.set_status(r)
+        breached_now = {i.name for i in r.issues if i.kind == "breached"}
+        new = breached_now - self.known_breached
+        self.known_breached = breached_now
+        if not background and self.isVisible():
+            return  # they're looking at the dashboard already
+        n = r.needs_changing
+        if new:
+            self.notify("Password found in a breach",
+                        f"{len(new)} of your passwords {'was' if len(new) == 1 else 'were'} "
+                        "just found in a data breach. Click to change "
+                        f"{'it' if len(new) == 1 else 'them'}.", warn=True)
+        elif explicit:
+            self.notify("Check finished",
+                        f"{n} password{'s' if n != 1 else ''} need{'s' if n == 1 else ''} "
+                        "changing." if n else f"All {r.scanned} passwords look safe.")
+        elif n:
+            last = self._when("reminded_problems_at")
+            if last is None or datetime.now() - last >= timedelta(days=REMINDER_DAYS):
+                self.settings.setValue("reminded_problems_at",
+                                       datetime.now().isoformat(timespec="seconds"))
+                self.notify("Passwords to change",
+                            f"{n} password{'s' if n != 1 else ''} still need"
+                            f"{'s' if n == 1 else ''} changing. Click to fix.")
+
+    def _background_failed(self, msg: str, explicit: bool) -> None:
+        updater.log(f"daily check failed: {msg}")
+        today = datetime.now().date().isoformat()
+        if "doesn't open this vault" in msg:
+            if explicit or self.settings.value("fail_notified_on", "") != today:
+                self.settings.setValue("fail_notified_on", today)
+                self.notify("Daily check couldn't unlock your vault",
+                            "The saved password no longer works (did the master password "
+                            "change?). Open vaultkit, unlock it and tick 'Remember on this PC' "
+                            "again.", warn=True)
+        elif explicit:
+            self.notify("Check didn't finish", msg, warn=True)
+        # offline etc.: stays due, so the hourly timer simply tries again
+
     # -- updates
     def check_updates(self) -> None:
         current = vk.__version__
@@ -1235,6 +1646,9 @@ class MainWindow(QMainWindow):
         notes = f" What's new: {staged.notes}" if staged.notes else ""
         self.banner.show_message(f"vaultkit {staged.version} is downloaded and verified. "
                                  f"It installs when the app restarts.{notes}", "Restart now")
+        if not self.isVisible():
+            self.notify("Update ready", f"vaultkit {staged.version} installs the next time "
+                        "vaultkit starts. Open vaultkit and click Restart now.")
 
     def _update_failed(self, msg: str) -> None:
         updater.log(f"check failed: {msg}")
@@ -1247,6 +1661,9 @@ class MainWindow(QMainWindow):
 
     def restart(self) -> None:
         self.lock()
+        if self.instance:
+            self.instance.close()  # let the new process become the running instance
+        self.quitting = True
         launcher = HERE / "launcher.py"
         subprocess.Popen([sys.executable, str(launcher)], cwd=str(HERE), close_fds=True)
         QApplication.instance().quit()
@@ -1274,40 +1691,85 @@ class MainWindow(QMainWindow):
         self.unlock.refresh(message)
 
     def closeEvent(self, event) -> None:
+        if self.tray is not None and not self.quitting:
+            # stay in the tray for the daily check, but never with the vault open
+            self.lock()
+            self.hide()
+            event.ignore()
+            if not self.settings.value("tray_hint_shown", False, type=bool):
+                self.settings.setValue("tray_hint_shown", True)
+                self.notify("vaultkit is still running",
+                            "It's locked and in the tray by the clock, doing the daily check. "
+                            "Right-click the icon to quit or turn on Start with Windows.")
+            return
         self.fix.reset()
         self.dash.close_vault()
         self.runner.wait()
         self.net.wait()
+        if self.tray is not None:
+            self.tray.hide()
         super().closeEvent(event)
 
+    def quit_app(self) -> None:
+        self.quitting = True
+        self.close()
+        QApplication.instance().quit()
 
-def apply_theme(app: QApplication) -> None:
-    app.setStyle("Fusion")  # consistent look; our palette, not the OS dark/light guess
+
+def system_prefers_dark() -> bool:
+    hints = QApplication.styleHints()
+    scheme = getattr(hints, "colorScheme", None)
+    return bool(scheme) and scheme() == Qt.ColorScheme.Dark
+
+
+def resolve_theme(key: str) -> Theme:
+    if key == "system" or key not in THEMES:
+        return THEMES["slate"] if system_prefers_dark() else THEMES["mist"]
+    return THEMES[key]
+
+
+def apply_theme(app: QApplication, key: str = "system") -> Theme:
+    """Switch every colour in the app. Safe to call again at any time."""
+    global T
+    T = resolve_theme(key)
+    app.setStyle("Fusion")  # consistent look; our palette, not the OS guess
+    hints = app.styleHints()
+    if hasattr(hints, "setColorScheme"):  # Qt 6.8+: dark/light native title bar on Windows 11
+        hints.setColorScheme(Qt.ColorScheme.Dark if T.dark else Qt.ColorScheme.Light)
     pal = QPalette()
-    pal.setColor(QPalette.ColorRole.Window, QColor(PAPER))
-    pal.setColor(QPalette.ColorRole.WindowText, QColor(INK))
-    pal.setColor(QPalette.ColorRole.Base, QColor(SURFACE))
-    pal.setColor(QPalette.ColorRole.AlternateBase, QColor(PAPER))
-    pal.setColor(QPalette.ColorRole.Text, QColor(INK))
-    pal.setColor(QPalette.ColorRole.Button, QColor(SURFACE))
-    pal.setColor(QPalette.ColorRole.ButtonText, QColor(INK))
-    pal.setColor(QPalette.ColorRole.Highlight, QColor("#DCE6F0"))
-    pal.setColor(QPalette.ColorRole.HighlightedText, QColor(INK))
-    pal.setColor(QPalette.ColorRole.ToolTipBase, QColor(SURFACE))
-    pal.setColor(QPalette.ColorRole.ToolTipText, QColor(INK))
-    pal.setColor(QPalette.ColorRole.PlaceholderText, QColor(MUTED))
+    roles = QPalette.ColorRole
+    for role, colour in ((roles.Window, T.paper), (roles.WindowText, T.ink), (roles.Base, T.surface),
+                         (roles.AlternateBase, T.paper), (roles.Text, T.ink),
+                         (roles.Button, T.surface), (roles.ButtonText, T.ink),
+                         (roles.Highlight, T.selection), (roles.HighlightedText, T.ink),
+                         (roles.ToolTipBase, T.surface), (roles.ToolTipText, T.ink),
+                         (roles.PlaceholderText, T.muted), (roles.Link, T.focus)):
+        pal.setColor(role, QColor(colour))
+    for role in (roles.WindowText, roles.Text, roles.ButtonText):
+        pal.setColor(QPalette.ColorGroup.Disabled, role, QColor(T.muted))
     app.setPalette(pal)
-    app.setStyleSheet(STYLE)
+    app.setStyleSheet(build_style(T))
+    return T
 
 
-def main(startup_note: str = "") -> int:
+def main(startup_note: str = "", start_hidden: bool = False) -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("vaultkit")
     app.setOrganizationName("vaultkit")
-    apply_theme(app)
+    if signal_running_instance(show=not start_hidden):
+        return 0  # already running: it brought its window forward (or was left in the tray)
+    apply_theme(app, QSettings("vaultkit", "vaultkit").value("theme", "system"))
     w = MainWindow(startup_note=startup_note)
+    w.instance = InstanceServer()
+    w.instance.show_requested.connect(w.show_window)
     w.resize(860, 640)
-    w.show()
+    if w.tray is not None:
+        app.setQuitOnLastWindowClosed(False)
+    if start_hidden and w.tray is not None:
+        if startup_note:
+            w.notify("vaultkit", startup_note)
+    else:
+        w.show()
     return app.exec()
 
 
