@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Minimal stand-in for keepassxc-cli used by the test suite. State lives in $FAKE_KP_STATE."""
 import csv, io, json, os, sys
+from datetime import datetime, timedelta, timezone
 
 sys.stdout.reconfigure(encoding="utf-8")
 sys.stdin.reconfigure(encoding="utf-8")
@@ -27,15 +28,20 @@ db, target = pos[0], (pos[1] if len(pos) > 1 else None)
 E = st["entries"]
 
 def save(): json.dump(st, open(state_path, "w"))
+def stamp(days): return (datetime.now(timezone.utc) + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
 def need(p):
     if p not in E: print(f"Could not find entry with path {p}.", file=sys.stderr); sys.exit(1)
 
 if cmd == "export":
     buf = io.StringIO(); w = csv.writer(buf, quoting=csv.QUOTE_ALL)
-    w.writerow(["Group", "Title", "Username", "Password", "URL", "Notes"])
+    # same columns, same order as the real CLI (CsvExporter: ... TOTP, Icon, Last Modified, Created)
+    w.writerow(["Group", "Title", "Username", "Password", "URL", "Notes", "TOTP", "Icon",
+                "Last Modified", "Created"])
     for p, e in E.items():
         g, _, t = p.rpartition("/")
-        w.writerow(["Root" + ("/" + g if g else ""), t, e["UserName"], e["Password"], e["URL"], e["Notes"]])
+        created = e.get("Created", stamp(-15))  # default: imported a fortnight ago
+        w.writerow(["Root" + ("/" + g if g else ""), t, e["UserName"], e["Password"], e["URL"],
+                    e["Notes"], "", "0", e.get("Modified", created), created])
     print(buf.getvalue(), end="")
 elif cmd == "show":
     need(target)
@@ -49,6 +55,7 @@ elif cmd == "edit":
     if opts.get("-p"):
         E[target].setdefault("History", []).append(E[target]["Password"])
         E[target]["Password"] = extra[0]
+    E[target]["Modified"] = stamp(0)  # like KeePassXC: ANY edit moves Last Modified
     save()
 elif cmd == "add":
     if target in E: print("entry exists", file=sys.stderr); sys.exit(1)

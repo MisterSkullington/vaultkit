@@ -6,12 +6,14 @@ from unittest import mock
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
+sys.path.insert(0, str(HERE))
 
 try:
     from PySide6.QtWidgets import QApplication
 except ImportError:  # pragma: no cover
     QApplication = None
 
+import fake_hibp  # noqa: E402
 import vaultkit as vk  # noqa: E402
 
 FAKE = str(HERE / "fake_kpcli.py")
@@ -54,6 +56,7 @@ class AppFlow(unittest.TestCase):
             mock.patch.object(vk.Vault, "__init__", init),
             mock.patch.object(vk, "fetch_range",
                               lambda p: f"{breached[5:]}:6421042\n" if p == breached[:5] else ""),
+            fake_hibp.patch(),
         ]
         for p in self.patches:
             p.start()
@@ -80,7 +83,9 @@ class AppFlow(unittest.TestCase):
     def shot(self, name):
         if SHOTS:
             Path(SHOTS).mkdir(parents=True, exist_ok=True)
-            self.qapp.processEvents()
+            for _ in range(5):  # let deferred layout requests settle, as they do on screen
+                self.qapp.processEvents()
+                time.sleep(0.02)
             self.win.grab().save(str(Path(SHOTS) / f"{name}.png"))
 
     def unlock(self, pw):
@@ -102,12 +107,21 @@ class AppFlow(unittest.TestCase):
         d = self.win.dash
         self.pump(lambda: d.report is not None)
         r = d.report
-        self.assertEqual((r.scanned, r.breached, r.reused, r.safe), (34, 2, 2, 30))
+        self.assertEqual((r.scanned, r.breached, r.at_risk, r.safe), (34, 2, 2, 30))
         self.assertEqual(d.verdict.text(), "4 passwords need changing")
         self.assertEqual(d.table.rowCount(), 4)
         self.assertTrue(d.table.item(0, 1).text().startswith("Found in 6,421,042 known breaches. "
-                                                              "Same password as 1 other entry."))
+                                                              "Same password as 1 other entry. "
+                                                              "Only 8 characters long."))
+        self.assertEqual([i.kind for i in r.issues], ["breached", "breached", "sitebreach", "reused"])
+        self.assertIn("Spotify had a breach in Nov 2020", d.table.item(2, 1).text())
+        self.assertEqual(r.score, round(100 * (1 - (1 + 1 + 0.6 + 0.6) / 34)))
+        self.assertEqual(d.score.number.text(), str(r.score))
+        self.assertEqual(d.score.number.property("tier"), "risk")  # 91, but 2 are breached: not green
+        self.assertEqual(self.appmod.score_tier(91), "safe")
+        self.assertEqual(d.leg_risk.text.text(), "At risk 2")
         self.assertTrue(Path(self.tmp.name, "vaultkit", "last-check.json").exists())
+        self.assertEqual([h["score"] for h in vk.load_history()], [r.score])
         self.shot("3-dashboard")
 
     def vault_entries(self):
@@ -161,7 +175,9 @@ class AppFlow(unittest.TestCase):
         # back on the dashboard, re-checked
         self.pump(lambda: self.win.stack.currentWidget() is d and d.report is not None
                   and d.report.breached == 0)
-        self.assertEqual(d.report.reused, 2)  # spotify + steam still share a password
+        self.assertEqual(d.report.at_risk, 2)  # spotify + steam still share a password
+        self.assertEqual(len(vk.load_history()), 1)  # same day: one point, the latest score
+        self.assertEqual(vk.load_history()[0]["score"], d.report.score)
         self.assertEqual(opened, ["https://bank/.well-known/change-password"])
         self.assertIn(vk.pending_path("Web/spotify"), self.vault_entries())  # skipped: kept for later
         self.assertEqual(self.qapp.clipboard().text(), "")  # clipboard wiped on finish
@@ -237,20 +253,67 @@ class UpdateBanner(unittest.TestCase):
 
 @unittest.skipIf(QApplication is None, "PySide6 not installed")
 class ReportModel(unittest.TestCase):
-    def test_all_safe(self):
+    @classmethod
+    def setUpClass(cls):
         import app as appmod
-        r = appmod.build_report([{"Path": "a"}], {}, [], [], 1)
-        self.assertEqual((r.needs_changing, r.safe, r.issues), (0, 1, []))
+        cls.appmod = appmod
+
+    @staticmethod
+    def rows(*paths, modified="2021-03-04T10:00:00"):
+        return [{"Path": p, "Last Modified": modified, "Created": "2020-01-01T00:00:00"}
+                for p in paths]
+
+    def result(self, rows, **kw):
+        return vk.ScanResult(rows, [r["Path"] for r in rows], kw.pop("hits", {}),
+                             kw.pop("reuse", []), kw.pop("dupes", []), len(rows), **kw)
+
+    def test_all_safe(self):
+        r = self.appmod.build_report(self.result(self.rows("a")))
+        self.assertEqual((r.needs_changing, r.safe, r.issues, r.score), (0, 1, [], 100))
 
     def test_breached_and_reused_merge_into_one_row(self):
-        import app as appmod
-        rows = [{"Path": p, "Last Modified": "2021-03-04T10:00:00"} for p in ("a", "b")]
-        r = appmod.build_report(rows, {"a": 5}, [["a", "b"]], [], 2)
+        r = self.appmod.build_report(self.result(self.rows("a", "b"), hits={"a": 5},
+                                                 reuse=[["a", "b"]]))
         self.assertEqual(len(r.issues), 2)
         self.assertEqual(r.issues[0].kind, "breached")
         self.assertEqual(r.issues[0].problem, "Found in 5 known breaches. Same password as 1 other entry.")
         self.assertEqual(r.issues[0].changed, "2021-03-04")
-        self.assertEqual((r.breached, r.reused, r.safe), (1, 1, 0))
+        self.assertEqual((r.breached, r.at_risk, r.safe), (1, 1, 0))
+
+    def test_every_kind_in_severity_order_with_one_row_each(self):
+        import breaches
+        from datetime import date
+        site = breaches.Breach("Adobe", "adobe.com", date(2023, 5, 1), True)
+        rows = self.rows("old", "sim1", "sim2", "weak", "site-new", "site-unknown", "dup", "dup")
+        res = self.result(
+            rows, dupes=["dup"],
+            weak={"weak": "Only 6 characters long."},
+            similar=[["sim1", "sim2"]],
+            old={"old": date(2019, 2, 1)},
+            sites={"site-new": breaches.SiteFinding(site, date(2021, 3, 4)),
+                   "site-unknown": breaches.SiteFinding(site, None)})
+        r = self.appmod.build_report(res)
+        self.assertEqual([(i.name, i.kind) for i in r.issues], [
+            ("site-new", "breached"), ("site-unknown", "sitebreach"), ("weak", "weak"),
+            ("sim1", "similar"), ("sim2", "similar"), ("old", "old"), ("dup", "samename")])
+        self.assertIn("after you last changed this one (Mar 2021)", r.issues[0].problem)
+        self.assertEqual(r.issues[3].tooltip, "Similar to: sim2")
+        self.assertEqual(r.issues[5].problem, "Not changed since Feb 2019.")
+        self.assertFalse(r.issues[-1].fixable)
+        self.assertEqual((r.breached, r.at_risk, r.samename), (1, 5, 1))
+        self.assertEqual(r.score, res.score)
+        colors = {i.kind: i.color for i in r.issues}
+        T = self.appmod.T
+        self.assertEqual((colors["breached"], colors["weak"], colors["old"], colors["samename"]),
+                         (T.breached, T.risk, T.risk, T.info))
+
+    def test_score_change_in_plain_words(self):
+        f = self.appmod.score_change
+        self.assertEqual(f([]), "Your trend builds up day by day.")
+        pts = [{"at": "2026-10-03T09:00:00", "score": 70}, {"at": "2026-10-16T09:00:00", "score": 76}]
+        self.assertEqual(f(pts), "Up 6 since 3 Oct")
+        self.assertEqual(f(pts[::-1]), "Down 6 since 16 Oct")
+        self.assertEqual(f([pts[0], {"at": "x", "score": 70}]), "Same as 3 Oct")
 
 
 if __name__ == "__main__":

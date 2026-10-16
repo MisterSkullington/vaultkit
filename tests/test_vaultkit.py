@@ -5,6 +5,8 @@ from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
+sys.path.insert(0, str(HERE))
+import fake_hibp  # noqa: E402
 import vaultkit as vk  # noqa: E402
 
 FAKE = str(HERE / "fake_kpcli.py")
@@ -107,14 +109,17 @@ class EndToEnd(unittest.TestCase):
             "Recycle Bin/old": {"UserName": "", "URL": "", "Password": "ignored", "Notes": ""},
         }}))
         self.env = mock.patch.dict(os.environ, {"FAKE_KP_STATE": str(self.state),
-                                                "XDG_STATE_HOME": self.tmp.name})
+                                                "XDG_STATE_HOME": self.tmp.name,
+                                                "LOCALAPPDATA": self.tmp.name})
         self.env.start()
+        self.hibp = fake_hibp.patch([fake_hibp.breach("github.com", "2020-01-01")])
+        self.hibp.start()
         self.base = ["--db", "v.kdbx", "--password-cmd", PWCMD.format("m4ster")]
         self.cli = mock.patch.object(vk.shutil, "which", return_value=None)
         self.cli.start()
 
     def tearDown(self):
-        self.env.stop(); self.cli.stop(); self.tmp.cleanup()
+        self.env.stop(); self.cli.stop(); self.hibp.stop(); self.tmp.cleanup()
 
     def run_vk(self, *args):
         out = io.StringIO()
@@ -145,8 +150,13 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertIn("Web/github", out)
         self.assertNotIn("Recycle Bin", out)
+        self.assertIn("Github had a breach in Jan 2020", out)
+        self.assertIn("Only 8 characters long", out)
+        self.assertIn("Health score: 0/100", out)   # both passwords breached
         report = json.loads(Path(self.tmp.name, "vaultkit", "last-check.json").read_text())
         self.assertNotIn("P@ssw0rd", json.dumps(report))  # no secrets in report
+        history = json.loads(Path(self.tmp.name, "vaultkit", "history.json").read_text())
+        self.assertEqual([(h["score"], h["breached"]) for h in history], [(0, 2)])
 
     def test_profile_then_rotate_commit(self):
         rc, out = self.run_vk("profile", "Web/github", "--length", "40", "--symbols", "none",
@@ -203,6 +213,20 @@ class EndToEnd(unittest.TestCase):
             rc, out = self.run_vk("fix", "Web/github")
         self.assertIn("already saved", out)
         self.assertEqual(self.entries()["Web/github"]["Password"], first)
+
+    def test_site_breach_clears_only_after_a_real_password_change(self):
+        h = vk.sha1_hex("P@ssw0rd")
+        with mock.patch.object(vk, "fetch_range", lambda p: f"{h[5:]}:99\n"):
+            self.run_vk("profile", "Web/github", "--length", "40")   # an edit, not a change
+            _, out = self.run_vk("check")
+            self.assertIn("Github had a breach in Jan 2020", out)
+            self.run_vk("rotate", "start", "Web/github")
+            self.run_vk("rotate", "commit", "Web/github")
+            notes = self.entries()["Web/github"]["Notes"]
+            self.assertIn(f"changed: {vk.date.today().isoformat()}", notes)
+            self.assertIn("length: 40", notes)  # rules kept
+            _, out = self.run_vk("check")
+        self.assertNotIn("Github had a breach", out)
 
     def test_rotate_abort_keeps_original(self):
         self.run_vk("rotate", "start", "Web/bank")

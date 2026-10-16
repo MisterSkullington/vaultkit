@@ -18,8 +18,8 @@ jobs:
       QT_QPA_PLATFORM: offscreen
       PYTHONUTF8: "1"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
           architecture: x64
@@ -48,5 +48,5 @@ jobs:
               for a, b in (("%", "%25"), ("\r", "%0D"), ("\n", "%0A"), (":", "%3A"), (",", "%2C")):
                   title = title.replace(a, b)
               print(f"::error title={title}::{msg}")
-          tail = "%0A".join(text.strip().splitlines()[-3:])
-          print(f"::notice title=summary::{tail}")
+          summary = [l for l in text.splitlines() if re.match(r"(Ran \d+ tests?|OK|FAILED)\b", l)]
+          print(f"::notice title=summary::{' / '.join(summary[-2:]) or 'tests did not finish'}")

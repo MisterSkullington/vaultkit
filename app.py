@@ -2,7 +2,7 @@
 """vaultkit app — a password-health dashboard on top of your KeePassXC vault.
 
 KeePassXC stays the database (and the place you view/edit passwords). This window shows
-which passwords are breached or reused. All vault access goes through keepassxc-cli via the
+which passwords are breached, weak, reused or old. All vault access goes through keepassxc-cli via the
 same core as the command-line tool; every slow call runs off the UI thread.
 
 Run on Windows without a console window:  pyw app.py
@@ -68,9 +68,9 @@ class Theme:
     disabled: str     # disabled primary button
     selection: str    # selected table row, info banner
     warn_bg: str      # warning banner
-    breached: str
-    reused: str
-    samename: str
+    breached: str     # status: password exposed
+    risk: str         # status: weak, reused, site breached, old
+    info: str         # status: not a password problem (shared names)
     safe: str
 
 
@@ -80,27 +80,27 @@ THEMES = {t.key: t for t in (
           paper="#EEF1F4", surface="#FFFFFF", ink="#1C2733", muted="#56657A", line="#D5DCE3",
           focus="#2F5D8A", focus_hover="#264D73", on_focus="#FFFFFF", disabled="#9FB3C8",
           selection="#DCE6F0", warn_bg="#F6E3E1",
-          breached="#B3261E", reused="#A8701C", samename="#5A5FA8", safe="#2E7D5B"),
+          breached="#B3261E", risk="#A8701C", info="#5A5FA8", safe="#2E7D5B"),
     Theme("slate", "Slate (dark)", True,
           paper="#161D24", surface="#1E2731", ink="#E3E9EF", muted="#9AA8B6", line="#2F3B47",
           focus="#7DAEDB", focus_hover="#96BFE4", on_focus="#0E1620", disabled="#3A4856",
           selection="#2A3B4D", warn_bg="#43252A",
-          breached="#EF6B5F", reused="#E2A445", samename="#9A9EEA", safe="#52B98A"),
+          breached="#EF6B5F", risk="#E2A445", info="#9A9EEA", safe="#52B98A"),
     Theme("ember", "Ember (dark, warm)", True,
           paper="#1A1416", surface="#241B1E", ink="#F2E6E3", muted="#B9A29E", line="#3A2C30",
           focus="#E8945A", focus_hover="#F0A876", on_focus="#1A1416", disabled="#5A4440",
           selection="#3A2A2C", warn_bg="#4A2228",
-          breached="#FF6577", reused="#F2C14E", samename="#B39DF0", safe="#6CC79A"),
+          breached="#FF6577", risk="#F2C14E", info="#B39DF0", safe="#6CC79A"),
     Theme("heather", "Heather (light)", False,
           paper="#F1EEF3", surface="#FFFFFF", ink="#2A2230", muted="#62566A", line="#DDD5E2",
           focus="#6B4C8A", focus_hover="#5A3E75", on_focus="#FFFFFF", disabled="#BCAFC7",
           selection="#E6DDEE", warn_bg="#F6E2E4",
-          breached="#B3261E", reused="#9A6210", samename="#3F6FB0", safe="#2E7D5B"),
+          breached="#B3261E", risk="#9A6210", info="#3F6FB0", safe="#2E7D5B"),
     Theme("contrast", "High contrast", True,
           paper="#000000", surface="#000000", ink="#FFFFFF", muted="#E0E0E0", line="#FFFFFF",
           focus="#FFD400", focus_hover="#FFE45C", on_focus="#000000", disabled="#555555",
           selection="#33330A", warn_bg="#3A0000",
-          breached="#FF7070", reused="#FFB000", samename="#A9B1FF", safe="#3DDC84"),
+          breached="#FF7070", risk="#FFB000", info="#A9B1FF", safe="#3DDC84"),
 )}
 THEME_CHOICES = [("system", "Match Windows")] + [(k, t.label) for k, t in THEMES.items()]
 T: Theme = THEMES["mist"]  # the active theme; everything reads colours from here
@@ -122,6 +122,11 @@ QLabel#title {{ font-family: "{DISPLAY}", "Segoe UI", sans-serif; font-size: 20p
 QLabel#verdict {{ font-family: "{DISPLAY}", "Segoe UI", sans-serif; font-size: 28pt;
                   font-weight: 600; }}
 QLabel#error {{ color: {t.breached}; }}
+QLabel#score {{ font-family: "{DISPLAY}", "Segoe UI", sans-serif; font-size: 28pt;
+                font-weight: 700; }}
+QLabel#score[tier="safe"] {{ color: {t.safe}; }}
+QLabel#score[tier="risk"] {{ color: {t.risk}; }}
+QLabel#score[tier="breached"] {{ color: {t.breached}; }}
 QLineEdit {{ background: {t.surface}; border: 1px solid {t.line}; border-radius: 6px;
              padding: 7px 9px; selection-background-color: {t.focus}; }}
 QLineEdit:focus {{ border: 2px solid {t.focus}; padding: 6px 8px; }}
@@ -295,7 +300,11 @@ def signal_running_instance(show: bool) -> bool:
     sock.write(b"show" if show else b"ping")
     sock.flush()
     sock.waitForBytesWritten(500)
-    sock.disconnectFromServer()
+    # Let the running instance read and hang up first: on Windows a named pipe closed by the
+    # writer straight away can lose the message. A hung instance costs at most a second.
+    if sock.state() != QLocalSocket.LocalSocketState.UnconnectedState:
+        sock.waitForDisconnected(1000)
+    sock.abort()
     return True
 
 
@@ -313,13 +322,19 @@ class InstanceServer(QObject):
         conn = self.server.nextPendingConnection()
         if conn is None:
             return
+        handled = []
+
         def read():
+            if handled or not conn.bytesAvailable():
+                return
+            handled.append(1)
             if bytes(conn.readAll()).startswith(b"show"):
                 self.show_requested.emit()
             conn.disconnectFromServer()
+            conn.deleteLater()
         conn.readyRead.connect(read)
-        if conn.bytesAvailable():
-            read()
+        conn.disconnected.connect(read)   # data can arrive together with the hang-up
+        read()
 
     def close(self) -> None:
         self.server.close()
@@ -398,17 +413,23 @@ def friendly_error(e: Exception) -> str:
 
 
 # ---------------------------------------------------------------------------- report model
+# Most serious first. The first kind an entry has decides its colour and its place in the list.
+SEVERITY = ("breached", "sitebreach", "reused", "weak", "similar", "old", "samename")
+TIER = {"breached": "breached", "sitebreach": "risk", "reused": "risk", "weak": "risk",
+        "similar": "risk", "old": "risk", "samename": "info"}
+
+
 @dataclass
 class Issue:
     name: str
-    kind: str          # "breached" | "reused" | "samename"
+    kind: str          # one of SEVERITY
     problem: str
     changed: str = ""
     tooltip: str = ""
 
     @property
     def color(self) -> str:
-        return {"breached": T.breached, "reused": T.reused, "samename": T.samename}[self.kind]
+        return getattr(T, TIER[self.kind])
 
     @property
     def fixable(self) -> bool:
@@ -419,12 +440,15 @@ class Issue:
 @dataclass
 class Report:
     scanned: int
-    breached: int
-    reused: int        # reused but not breached
+    breached: int      # password seen in a breach, or its site breached since it was set
+    at_risk: int       # any other password problem
     samename: int
     issues: list[Issue] = field(default_factory=list)
     checked_at: datetime = field(default_factory=datetime.now)
     rows: dict[str, dict[str, str]] = field(default_factory=dict)  # by path, no passwords
+    score: int = 100
+    history: list[dict] = field(default_factory=list)  # vk.load_history() points
+    sites_error: str = ""
 
     @property
     def fixable(self) -> list[Issue]:
@@ -432,50 +456,83 @@ class Report:
 
     @property
     def safe(self) -> int:
-        return max(self.scanned - self.breached - self.reused, 0)
+        return max(self.scanned - self.breached - self.at_risk, 0)
 
     @property
     def needs_changing(self) -> int:
-        return self.breached + self.reused
+        return self.breached + self.at_risk
 
 
-def build_report(rows: list[dict[str, str]], hits: dict[str, int], reuse: list[list[str]],
-                 dupes: list[str], scanned: int) -> Report:
-    changed = {r["Path"]: (r.get("Last Modified") or "")[:10] for r in rows}
+def _entries(n: int) -> str:
+    return f"{n} other {'entry' if n == 1 else 'entries'}"
+
+
+def last_changed(row: dict[str, str]) -> str:
+    """The password's date if vaultkit set it, else the entry's last edit of any kind."""
+    known = vk.password_set_on(row)
+    return known.isoformat() if known else (row.get("Last Modified") or "")[:10]
+
+
+def build_report(res: vk.ScanResult, history: list[dict] | None = None) -> Report:
+    changed = {r["Path"]: last_changed(r) for r in res.rows}
 
     def when(key: str) -> str:
         return changed.get(key.split(" [user: ")[0], "")
 
-    issues: dict[str, Issue] = {}
-    for key, n in sorted(hits.items(), key=lambda kv: (-kv[1], kv[0])):
-        issues[key] = Issue(key, "breached", f"Found in {n:,} known breaches.", when(key))
-    reused_only = 0
-    for group in reuse:
+    found: dict[str, list[tuple[str, str, str]]] = {}   # key -> [(kind, sentence, tooltip)]
+
+    def add(key: str, kind: str, text: str, tip: str = "") -> None:
+        found.setdefault(key, []).append((kind, text, tip))
+
+    for key, n in sorted(res.hits.items(), key=lambda kv: (-kv[1], kv[0])):
+        add(key, "breached", f"Found in {n:,} known breach{'es' if n != 1 else ''}.")
+    for key, f in sorted(res.sites.items(), key=lambda kv: (not kv[1].after_change, kv[0])):
+        add(key, "breached" if f.after_change else "sitebreach", f.text())
+    for group in res.reuse:
         for key in group:
             others = [k for k in group if k != key]
-            text = (f"Same password as {len(others)} other "
-                    f"{'entry' if len(others) == 1 else 'entries'}")
-            tip = "Also used by: " + ", ".join(others)
-            if key in issues:
-                issues[key].problem += f" {text}."
-                issues[key].tooltip = tip
-            else:
-                issues[key] = Issue(key, "reused", f"{text}.", when(key), tip)
-                reused_only += 1
-    for d in dupes:
-        n = sum(1 for r in rows if r["Path"] == d)
-        issues.setdefault(f"{d} (name)", Issue(
-            d, "samename", f"{n} entries share this name. Rename them in KeePassXC so each "
-            "can be fixed on its own.", changed.get(d, "")))
-    order = {"breached": 0, "reused": 1, "samename": 2}
-    ranked = sorted(issues.values(), key=lambda i: order[i.kind])
-    return Report(scanned, len(hits), reused_only, len(dupes), ranked,
-                  rows={r["Path"]: r for r in rows})
+            add(key, "reused", f"Same password as {_entries(len(others))}.",
+                "Also used by: " + ", ".join(others))
+    for key, why in res.weak.items():
+        add(key, "weak", why)
+    for group in res.similar:
+        for key in group:
+            others = [k for k in group if k != key]
+            add(key, "similar", f"Nearly the same password as {_entries(len(others))}, so "
+                "one leak gives the others away.", "Similar to: " + ", ".join(others))
+    for key, day in res.old.items():
+        add(key, "old", f"Not changed since {day:%b %Y}.")
+
+    issues: list[Issue] = []
+    for key, items in found.items():
+        items.sort(key=lambda i: SEVERITY.index(i[0]))   # stable: keeps the order added
+        tips = [t for _, _, t in items if t]
+        issues.append(Issue(key, items[0][0], " ".join(t for _, t, _ in items), when(key),
+                            "\n".join(tips)))
+    for d in res.dupes:
+        n = sum(1 for r in res.rows if r["Path"] == d)
+        issues.append(Issue(d, "samename", f"{n} entries share this name. Rename them in "
+                            "KeePassXC so each can be fixed on its own.", changed.get(d, "")))
+    issues.sort(key=lambda i: SEVERITY.index(i.kind))  # stable within a kind
+
+    kinds = list(res.problems().values())
+    breached = kinds.count("breached")
+    return Report(res.scanned, breached, len(kinds) - breached, len(res.dupes), issues,
+                  rows={r["Path"]: r for r in res.rows}, score=res.score,
+                  history=list(history or []), sites_error=res.sites_error)
+
+
+def run_scan(v: vk.Vault) -> Report:
+    """The full check, run on a worker thread: scan, save the report and today's score."""
+    res = vk.scan_full(v)
+    vk.write_report(res.hits, res.reuse, res.dupes, vk.site_breached(res))
+    vk.record_history(res)
+    return build_report(res, vk.load_history())
 
 
 # ---------------------------------------------------------------------------- widgets
 class HealthBar(QWidget):
-    """The vault in one line: safe / reused / breached, proportional to entry counts."""
+    """The vault in one line: breached / at risk / safe, proportional to entry counts."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -489,10 +546,10 @@ class HealthBar(QWidget):
 
     def set_report(self, r: Report | None) -> None:
         self.segments = [] if r is None else [
-            (r.breached, "breached"), (r.reused, "reused"), (r.safe, "safe")]
+            (r.breached, "breached"), (r.at_risk, "risk"), (r.safe, "safe")]
         if r:
             self.setAccessibleDescription(
-                f"{r.breached} breached, {r.reused} reused, {r.safe} safe")
+                f"{r.breached} breached, {r.at_risk} at risk, {r.safe} safe")
         self.update()
 
     def paintEvent(self, _event) -> None:
@@ -514,6 +571,115 @@ class HealthBar(QWidget):
                 p.fillRect(seg, QColor(getattr(T, c)))
                 x += w
         p.end()
+
+
+def score_tier(score: int, breached: int = 0) -> str:
+    """Colour for a score. Never 'safe' green while any password is breached."""
+    tier = "safe" if score >= 90 else ("risk" if score >= 60 else "breached")
+    return "risk" if breached and tier == "safe" else tier
+
+
+class Trend(QWidget):
+    """A sparkline of the daily health score (vk.load_history), newest on the right."""
+    DAYS = 30
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.scores: list[int] = []
+        self.tier = "safe"
+        self.setFixedSize(132, 30)
+        self.setAccessibleName("Health score trend")
+
+    def set_scores(self, scores: list[int], tier: str) -> None:
+        self.scores, self.tier = scores[-self.DAYS:], tier
+        self.setAccessibleDescription(", ".join(map(str, self.scores)))
+        self.update()
+
+    def paintEvent(self, _event) -> None:
+        if len(self.scores) < 2:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pad = 4.0
+        w, h = self.width() - 2 * pad, self.height() - 2 * pad
+        lo, hi = min(self.scores), max(self.scores)
+        if hi - lo < 10:  # a flat-ish week shouldn't look like a rollercoaster
+            mid = (hi + lo) / 2
+            lo, hi = mid - 5, mid + 5
+        step = w / (len(self.scores) - 1)
+        pts = [(pad + i * step, pad + h - (v - lo) / (hi - lo) * h)
+               for i, v in enumerate(self.scores)]
+        path = QPainterPath()
+        path.moveTo(*pts[0])
+        for x, y in pts[1:]:
+            path.lineTo(x, y)
+        pen = p.pen()
+        pen.setColor(QColor(T.muted))
+        pen.setWidthF(1.6)
+        p.setPen(pen)
+        p.drawPath(path)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(getattr(T, self.tier)))
+        p.drawEllipse(QRectF(pts[-1][0] - 3.5, pts[-1][1] - 3.5, 7, 7))
+        p.end()
+
+
+class ScoreCard(QWidget):
+    """Health score out of 100, with the trend over recent days."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(2)
+        cap = QLabel("Health score")
+        cap.setObjectName("muted")
+        row = QHBoxLayout()
+        row.setSpacing(4)
+        self.number = QLabel()
+        self.number.setObjectName("score")
+        out_of = QLabel("/ 100")
+        out_of.setObjectName("muted")
+        row.addWidget(self.number)
+        row.addWidget(out_of, 0, Qt.AlignmentFlag.AlignBottom)
+        row.addStretch(1)
+        self.trend = Trend()
+        self.change = QLabel()
+        self.change.setObjectName("muted")
+        lay.addWidget(cap)
+        lay.addLayout(row)
+        lay.addWidget(self.trend)
+        lay.addWidget(self.change)
+
+    def set_report(self, r: Report | None) -> None:
+        self.setVisible(r is not None)
+        if r is None:
+            return
+        tier = score_tier(r.score, r.breached)
+        self.number.setText(str(r.score))
+        self.number.setProperty("tier", tier)
+        self.number.style().unpolish(self.number)
+        self.number.style().polish(self.number)
+        points = r.history[-Trend.DAYS:]
+        self.trend.set_scores([h["score"] for h in points], tier)
+        self.trend.setVisible(len(points) >= 2)
+        self.change.setText(score_change(points))
+        self.setAccessibleName(f"Health score {r.score} out of 100. {self.change.text()}")
+
+
+def score_change(points: list[dict]) -> str:
+    """'Up 6 since 3 Oct', in plain words, from the first to the last point shown."""
+    if len(points) < 2:
+        return "Your trend builds up day by day."
+    first, last = points[0], points[-1]
+    try:
+        since = datetime.fromisoformat(first["at"]).strftime("%d %b").lstrip("0")
+    except (KeyError, ValueError):
+        since = "your first check"
+    d = last["score"] - first["score"]
+    if d == 0:
+        return f"Same as {since}"
+    return f"{'Up' if d > 0 else 'Down'} {abs(d)} since {since}"
 
 
 class NumberField(QLineEdit):
@@ -808,9 +974,18 @@ class DashboardPage(QWidget):
         self.sub = QLabel()
         self.sub.setObjectName("muted")
         self.sub.setWordWrap(True)
-        lay.addWidget(self.verdict)
-        lay.addSpacing(4)
-        lay.addWidget(self.sub)
+        head = QHBoxLayout()
+        head.setSpacing(24)
+        words = QVBoxLayout()
+        words.setSpacing(4)
+        words.addWidget(self.verdict)
+        words.addWidget(self.sub)
+        words.addStretch(1)
+        head.addLayout(words, 1)
+        self.score = ScoreCard()
+        self.score.hide()
+        head.addWidget(self.score, 0, Qt.AlignmentFlag.AlignTop)
+        lay.addLayout(head)
         lay.addSpacing(16)
 
         self.bar = HealthBar()
@@ -819,9 +994,9 @@ class DashboardPage(QWidget):
         leg = QHBoxLayout()
         leg.setSpacing(18)
         self.leg_breached = LegendItem("breached", "")
-        self.leg_reused = LegendItem("reused", "")
+        self.leg_risk = LegendItem("risk", "")
         self.leg_safe = LegendItem("safe", "")
-        for w in (self.leg_breached, self.leg_reused, self.leg_safe):
+        for w in (self.leg_breached, self.leg_risk, self.leg_safe):
             leg.addWidget(w)
         leg.addStretch(1)
         self.legend = QWidget()
@@ -891,15 +1066,11 @@ class DashboardPage(QWidget):
         self.check_btn.setText("Checking…")
         self.verdict.setText("Checking your vault…")
         self.sub.setText("Reading entries through KeePassXC, then checking each password "
-                         "against known breaches. Only the first 5 characters of each "
-                         "password's hash leave this PC.")
+                         "against known breaches (only the first 5 characters of its hash "
+                         "leave this PC) and your sites against the public list of breached "
+                         "websites, matched on this PC.")
 
-        def work() -> Report:
-            rows, hits, reuse, dupes, scanned = vk.scan(v)
-            vk.write_report(hits, reuse, dupes)
-            return build_report(rows, hits, reuse, dupes, scanned)
-
-        self.runner.submit(work, self._checked, self._check_failed)
+        self.runner.submit(lambda: run_scan(v), self._checked, self._check_failed)
 
     def _checked(self, r: Report) -> None:
         self.check_btn.setEnabled(True)
@@ -925,6 +1096,7 @@ class DashboardPage(QWidget):
         self.check_btn.style().polish(self.check_btn)
         self.hint.setVisible(bool(r and r.fixable))
         self.bar.set_report(r)
+        self.score.set_report(r)
         self.legend.setVisible(r is not None)
         self.table.setRowCount(0)
         if r is None:
@@ -939,9 +1111,12 @@ class DashboardPage(QWidget):
             f"{n} password{'s' if n != 1 else ''} need{'' if n != 1 else 's'} changing")
         extra = (f" {r.samename} name{'s are' if r.samename != 1 else ' is'} shared by more "
                  "than one entry." if r.samename else "")
+        if r.sites_error:
+            extra += (" The list of breached websites couldn't be downloaded, so that part "
+                      "was skipped this time.")
         self.sub.setText(f"Checked {r.scanned} passwords at {r.checked_at:%H:%M}.{extra}")
         self.leg_breached.text.setText(f"Breached {r.breached}")
-        self.leg_reused.text.setText(f"Reused {r.reused}")
+        self.leg_risk.text.setText(f"At risk {r.at_risk}")
         self.leg_safe.text.setText(f"Safe {r.safe}")
 
         if not r.issues:
@@ -1501,8 +1676,9 @@ class MainWindow(QMainWindow):
     def refresh_theme(self) -> None:
         for m in self.theme_menus:
             m.sync(self.theme_key)
-        for leg in (self.dash.leg_breached, self.dash.leg_reused, self.dash.leg_safe):
+        for leg in (self.dash.leg_breached, self.dash.leg_risk, self.dash.leg_safe):
             leg.repaint_dot()
+        self.dash.score.trend.update()
         if self.dash.report is not None:
             self.dash.show_report(self.dash.report)  # re-colour the issue swatches
         self.dash.bar.update()
@@ -1588,8 +1764,8 @@ class MainWindow(QMainWindow):
             return
         status = "bad" if r.breached else ("warn" if r.needs_changing else "ok")
         self.tray.setIcon(make_icon(status))
-        summary = (f"{r.needs_changing} need changing" if r.needs_changing
-                   else "all passwords look safe")
+        summary = (f"score {r.score}, {r.needs_changing} need changing" if r.needs_changing
+                   else f"score {r.score}, all passwords look safe")
         self.tray.setToolTip(f"vaultkit {vk.__version__}: {summary} "
                              f"(checked {r.checked_at:%a %H:%M})")
 
@@ -1613,7 +1789,7 @@ class MainWindow(QMainWindow):
     def _load_known_breached() -> set[str]:
         try:
             data = json.loads((vk.state_dir() / "last-check.json").read_text("utf-8"))
-            return set(data.get("breached", {}))
+            return set(data.get("breached", {})) | set(data.get("site_breached", []))
         except (OSError, ValueError):
             return set()
 
@@ -1651,9 +1827,7 @@ class MainWindow(QMainWindow):
 
         def work() -> Report:
             try:
-                rows, hits, reuse, dupes, scanned = vk.scan(v)
-                vk.write_report(hits, reuse, dupes)
-                return build_report(rows, hits, reuse, dupes, scanned)
+                return run_scan(v)
             finally:
                 v.lock()  # the saved password is only in memory for the length of the check
 
@@ -1672,7 +1846,7 @@ class MainWindow(QMainWindow):
         if new:
             self.notify("Password found in a breach",
                         f"{len(new)} of your passwords {'was' if len(new) == 1 else 'were'} "
-                        "just found in a data breach. Click to change "
+                        "just found in, or exposed by, a data breach. Click to change "
                         f"{'it' if len(new) == 1 else 'them'}.", warn=True)
         elif explicit:
             self.notify("Check finished",

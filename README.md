@@ -1,9 +1,14 @@
 # vaultkit — password health for your KeePassXC vault
 
+[![tests](https://github.com/MisterSkullington/vaultkit/actions/workflows/tests.yml/badge.svg)](https://github.com/MisterSkullington/vaultkit/actions/workflows/tests.yml)
+
 KeePassXC is the vault: it stores your passwords, and its browser extension fills them in.
-vaultkit checks them for breaches and reuse, and walks you through changing the bad ones.
-Everything runs on your PC. The only thing sent anywhere is the first 5 characters of each
-password's SHA-1 hash, to the free Pwned Passwords service; the match happens locally.
+vaultkit checks them (breached, weak, reused, near-identical, old, and sites that were
+breached), gives the vault a health score, and walks you through changing the bad ones.
+Everything runs on your PC. What leaves it: the first 5 characters of each password's SHA-1
+hash, to the free Pwned Passwords service (the match happens locally), and a once-a-day
+download of Have I Been Pwned's public list of breached websites, which is matched locally
+too, so nobody learns which sites you use.
 
 Everything lives in one folder:
 
@@ -31,7 +36,10 @@ tools/release.py    signs and publishes a release (run on your PC; the key stays
 vaultkit.py         the command-line tool (same core the app uses)
 vaultkit.cmd        lets you type `vaultkit ...` instead of `py vaultkit.py ...`
 secretstore.py      optional saved password for unattended checks (Windows DPAPI)
-tests/              66 tests, incl. headless GUI tests against a fake keepassxc-cli
+breaches.py         which of your sites had a breach, and was it after your last change
+strength.py         weak and near-identical password checks (nothing leaves the PC)
+tests/              85 tests, incl. headless GUI tests against a fake keepassxc-cli;
+                    run on real Windows by GitHub Actions on every push
 ```
 
 Needs: Windows 10/11, KeePassXC (with `C:\Program Files\KeePassXC` on PATH), Python 3.10+. The app needs **64-bit** Python (PySide6 has no 32-bit Windows build); the launcher uses `pyw -3.13`.
@@ -50,7 +58,23 @@ Then double-click **Open vaultkit.cmd**. Pin it to Start for quick access (right
 
 - **Unlock:** choose your `.kdbx`, type the master password. It's held in memory only.
 - **Dashboard:** checks automatically after unlocking. Shows how many passwords need
-  changing, a bar of breached / reused / safe, and a list of each problem.
+  changing, a **health score** out of 100 with its trend over the last 30 days, a bar of
+  breached / at risk / safe, and a list of each problem (see *What the check looks for*).
+- **Fix passwords:** walks through every entry with a problem, most serious first, one site at a time
+  (double-click a row to fix just that one):
+  1. a new password is made and **saved in your vault first**, then copied for 45 s
+     (kept out of Windows clipboard history);
+  2. **Open change page** takes you to the site's change-password page;
+  3. once you've logged back in with it, press **The site accepted it**. The old password
+     stays in the entry's History in KeePassXC.
+
+  **The site rejected it** discards the new one and opens that site's password rules
+  (length, allowed symbols, change page, two-step login). Set what the site allows, then
+  **Save rules and make a new password**. **Skip for now** keeps the new password for next
+  time. Afterwards the dashboard re-checks automatically.
+
+  If the app auto-locks while you're on a website, nothing is lost: unlock and press
+  Fix passwords again, and it picks up the saved new password.
 - **Auto-lock:** after 5 minutes with no mouse or keyboard activity, the password is dropped
   and you're back at the unlock screen.
 - **Remember on this PC for daily checks:** optional. See *Saved password* below.
@@ -71,6 +95,31 @@ Then double-click **Open vaultkit.cmd**. Pin it to Start for quick access (right
 - **Start menu:** the app adds itself the first time it runs: press the Windows key and type
   *vaultkit*. It also keeps *Open vaultkit* in the project folder pointing at the right place,
   with the vaultkit icon and no console window flashing up.
+
+## What the check looks for
+
+Most serious first. An entry with several problems is listed once, under the worst.
+
+| | Problem | Why it matters |
+|---|---|---|
+| Breached | The password itself is in Pwned Passwords | Attackers try every leaked password first |
+| Breached | Its website had a breach that exposed passwords **after** vaultkit last changed it | That password may be in someone's hands |
+| At risk | Its website had such a breach, and vaultkit doesn't know when the password was set | Change it if you haven't since the breach |
+| At risk | Same password as another entry | One leak opens every account that shares it |
+| At risk | Weak: short, a keyboard run, a word plus numbers (*Summer2024!*), a dressed-up word (*Tr0ub4dor&3*) | Cracked in minutes, offline |
+| At risk | Nearly the same as another entry (*Summer2023!* / *Summer2024!*) | One leak gives the others away |
+| At risk | Not changed in 3+ years | More time to have leaked somewhere |
+
+**Health score:** 100 minus a share for each entry with a problem, scaled by how serious
+(a breached password counts fully, an old one a fifth). It's shown in amber, never green,
+while any password is breached. One point a day is kept in `history.json` (scores and
+counts only, never names) for the trend line.
+
+**Password dates.** KeePassXC's *Last Modified* moves on any edit (notes, URL, password
+rules), so vaultkit can't use it to judge whether a password predates a breach. Instead it
+writes `changed: YYYY-MM-DD` into the entry's vaultkit notes block whenever it sets a new
+password. Passwords you imported or changed in KeePassXC by hand have no such date, so a
+breach of their site stays listed as *At risk* until you change them through vaultkit.
 
 ## Another PC
 
@@ -98,34 +147,19 @@ py -3.13 launcher.py --uninstall
 It removes Start with Windows, the shortcuts, the saved master password, settings and update
 files, then tells you which folder to delete. It never touches your vault, and on the PC you
 publish from it keeps your signing key.
-- **Fix passwords:** walks through every breached or reused entry, one site at a time
-  (double-click a row to fix just that one):
-  1. a new password is made and **saved in your vault first**, then copied for 45 s
-     (kept out of Windows clipboard history);
-  2. **Open change page** takes you to the site's change-password page;
-  3. once you've logged back in with it, press **The site accepted it**. The old password
-     stays in the entry's History in KeePassXC.
-
-  **The site rejected it** discards the new one and opens that site's password rules
-  (length, allowed symbols, change page, two-step login). Set what the site allows, then
-  **Save rules and make a new password**. **Skip for now** keeps the new password for next
-  time. Afterwards the dashboard re-checks automatically.
-
-  If the app auto-locks while you're on a website, nothing is lost: unlock and press
-  Fix passwords again, and it picks up the saved new password.
 
 ## Command line
 
 | Command | What it does |
 |---|---|
-| `vaultkit check` | Breach + reuse check over the whole vault |
-| `vaultkit fix` | Walks through each breached/reused entry (see below) |
+| `vaultkit check` | Every check over the whole vault, with the health score |
+| `vaultkit fix` | Walks through each entry with a problem, breached first (see below) |
 | `vaultkit fix "Web/github"` | Just that entry |
 | `vaultkit profile "Web/github" --length 64 --symbols none --2fa totp` | Per-site rules for new passwords |
 | `vaultkit rotate list` | Rotations started but not finished |
 | `vaultkit remember` / `vaultkit forget` | Save / delete the master password for unattended checks |
 | `vaultkit shred FILE` | Overwrite and delete an exported CSV |
-| `vaultkit --version` | Should say 1.7.1 |
+| `vaultkit --version` | Should say 1.8.0 |
 
 `vaultkit` works from any PowerShell window once this folder is on your PATH (one time):
 ```powershell
@@ -227,6 +261,8 @@ turn on auto-fill for single credentials and auto-submit.
 ## Gotchas
 
 - Each keepassxc-cli call takes ~1 s by design (Argon2). A check is one unlock; a rotation is a few.
+- The list of breached websites is cached for a day in `%LOCALAPPDATA%\vaultkit`. If it can't be
+  downloaded, that one check is skipped and the dashboard says so; everything else still runs.
 - Python can't wipe strings from memory; the master password lives in the app's memory until
   lock or exit. Auto-lock limits that window.
 - Run the tests: `py -m unittest discover -s tests`

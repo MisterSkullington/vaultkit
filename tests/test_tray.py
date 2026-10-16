@@ -1,11 +1,12 @@
 """M4 (tray, daily check, notifications, autostart, single instance) and themes. Headless."""
-import json, os, sys, tempfile, time, unittest
+import json, os, subprocess, sys, tempfile, time, unittest
 from pathlib import Path
 from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
+sys.path.insert(0, str(HERE))
 
 try:
     from PySide6.QtWidgets import QApplication
@@ -13,6 +14,7 @@ except ImportError:  # pragma: no cover
     QApplication = None
 
 import autostart  # noqa: E402
+import fake_hibp  # noqa: E402
 import secretstore  # noqa: E402
 import vaultkit as vk  # noqa: E402
 
@@ -73,6 +75,7 @@ class Base(unittest.TestCase):
             mock.patch.object(secretstore, "supported", lambda: True),
             mock.patch.object(secretstore, "protect", fake_protect),
             mock.patch.object(secretstore, "unprotect", fake_unprotect),
+            fake_hibp.patch([]),
         ]
         for p in self.patches:
             p.start()
@@ -204,28 +207,48 @@ class Themes(Base):
         self.assertEqual(self.win.dash.table.rowCount(), 1)
 
 
+SECOND_LAUNCH = """
+import sys
+sys.path.insert(0, sys.argv[1])
+import app
+app.INSTANCE_NAME = sys.argv[2]
+from PySide6.QtCore import QCoreApplication
+QCoreApplication([])
+print(app.signal_running_instance(show=sys.argv[3] == "show"))
+"""
+
+
 @unittest.skipIf(QApplication is None, "PySide6 not installed")
 class SingleInstance(unittest.TestCase):
+    """A real second process, as when the user double-clicks the shortcut again."""
+
+    def launch(self, qapp, name, mode):
+        p = subprocess.Popen([sys.executable, "-c", SECOND_LAUNCH, str(HERE.parent), name, mode],
+                             stdout=subprocess.PIPE, text=True)
+        end = time.time() + 30
+        while p.poll() is None and time.time() < end:
+            qapp.processEvents()  # the first instance keeps running its event loop meanwhile
+            time.sleep(0.01)
+        out = p.communicate(timeout=5)[0].strip()
+        for _ in range(20):
+            qapp.processEvents()
+            time.sleep(0.01)
+        return out
+
     def test_second_launch_shows_the_first(self):
         import app as appmod
         qapp = QApplication.instance() or QApplication([])
-        with mock.patch.object(appmod, "INSTANCE_NAME", f"vaultkit-test-{os.getpid()}"):
+        name = f"vaultkit-test-{os.getpid()}"
+        with mock.patch.object(appmod, "INSTANCE_NAME", name):
             server = appmod.InstanceServer()
             shown = []
             server.show_requested.connect(lambda: shown.append(1))
-            self.assertTrue(appmod.signal_running_instance(show=True))
-            end = time.time() + 5
-            while not shown and time.time() < end:
-                qapp.processEvents()
-                time.sleep(0.02)
+            self.assertEqual(self.launch(qapp, name, "show"), "True")
             self.assertEqual(shown, [1])
-            self.assertTrue(appmod.signal_running_instance(show=False))  # tray start: stay hidden
-            for _ in range(20):
-                qapp.processEvents()
-                time.sleep(0.01)
+            self.assertEqual(self.launch(qapp, name, "tray"), "True")  # tray start: stay hidden
             self.assertEqual(shown, [1])
             server.close()
-            self.assertFalse(appmod.signal_running_instance(show=True))
+            self.assertEqual(self.launch(qapp, name, "show"), "False")
 
 
 class FakeRegistry:

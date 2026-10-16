@@ -40,12 +40,12 @@ import urllib.request
 import webbrowser
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from dataclasses import asdict, dataclass, field, replace
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Iterable
 
-__version__ = "1.7.1"
+__version__ = "1.8.0"
 PENDING_GROUP = "vaultkit-pending"
 SKIP_GROUPS = {"Recycle Bin"}
 HIBP_RANGE_URL = "https://api.pwnedpasswords.com/range/{prefix}"
@@ -86,6 +86,7 @@ class Profile:
     symbols: str = DEFAULT_SYMBOLS  # "" == alphanumeric only
     change_url: str = ""
     twofa: str = "none"  # totp | sms | webauthn | email | none
+    changed: str = ""    # YYYY-MM-DD vaultkit last set this password ("" = never/unknown)
 
     def render(self) -> str:
         sym = self.symbols if self.symbols else "none"
@@ -95,6 +96,7 @@ class Profile:
             f"symbols: {sym}",
             f"change_url: {self.change_url}",
             f"2fa: {self.twofa}",
+            *([f"changed: {self.changed}"] if self.changed else []),
             PROFILE_END,
         ])
 
@@ -117,11 +119,23 @@ def parse_profile(notes: str) -> Profile | None:
             p.change_url = val
         elif key == "2fa":
             p.twofa = val
+        elif key == "changed":
+            p.changed = val
     return p
 
 
+def password_set_on(row: dict[str, str]) -> date | None:
+    """When vaultkit last set this entry's password, if it ever did. KeePassXC's Last Modified
+    can't tell us: it moves on ANY edit (notes, URL, rules), not just password changes."""
+    prof = parse_profile(row.get("Notes", "") or "")
+    return _day(prof.changed) if prof else None
+
+
 def upsert_profile(notes: str, profile: Profile) -> str:
-    """Replace the vaultkit block in Notes, preserving everything the user wrote."""
+    """Replace the vaultkit block in Notes, preserving everything the user wrote (and the
+    password date, unless `profile` sets a new one)."""
+    if not profile.changed and (old := parse_profile(notes)) and old.changed:
+        profile = replace(profile, changed=old.changed)
     lines = notes.splitlines()
     if PROFILE_START in lines and PROFILE_END in lines:
         s, e = lines.index(PROFILE_START), lines.index(PROFILE_END)
@@ -288,8 +302,10 @@ class Vault:
     def set_notes(self, entry: str, notes: str) -> None:
         self.run("edit", "--notes", notes, self.db, entry)
 
-    def set_password(self, entry: str, pw: str) -> None:
-        self.run("edit", "-p", self.db, entry, extra_stdin=[pw])
+    def set_password(self, entry: str, pw: str, notes: str | None = None) -> None:
+        """New password (and optionally new notes) in one edit, so one unlock."""
+        flags = ["--notes", notes] if notes is not None else []
+        self.run("edit", *flags, "-p", self.db, entry, extra_stdin=[pw])
 
     def add(self, entry: str, pw: str, username: str = "", url: str = "", notes: str = "") -> None:
         args = ["-p"]
@@ -358,63 +374,216 @@ def keyed_passwords(rows: list[dict[str, str]]) -> tuple[dict[str, str], list[st
     group can't be targeted safely. They're still breach-checked (under a disambiguated
     display key) but never rotated automatically.
     """
+    keys, dupes = display_keys(rows)
+    return {k: r.get("Password", "") for k, r in zip(keys, rows)}, dupes
+
+
+def display_keys(rows: list[dict[str, str]]) -> tuple[list[str], list[str]]:
+    """One unique name per row (its path, disambiguated when a title repeats) + the repeats."""
     counts = Counter(r["Path"] for r in rows)
     dupes = sorted(p for p, n in counts.items() if n > 1)
-    out: dict[str, str] = {}
+    keys: list[str] = []
+    seen: set[str] = set()
     for r in rows:
         key = r["Path"]
         if counts[key] > 1:
             base = f"{key} [user: {r.get('Username') or '?'}]"
             key, i = base, 1
-            while key in out:
+            while key in seen:
                 i += 1
                 key = f"{base} #{i}"
-        out[key] = r.get("Password", "")
-    return out, dupes
+        keys.append(key)
+        seen.add(key)
+    return keys, dupes
 
 
-def scan(v: Vault) -> tuple[list[dict[str, str]], dict[str, int], list[list[str]], list[str], int]:
+OLD_AFTER = timedelta(days=3 * 365)
+# Weight of each problem in the health score: a breached password counts fully against it,
+# an old one barely. An entry with several problems counts once, by its worst.
+PENALTY = {"breached": 1.0, "sitebreach": 0.5, "reused": 0.6, "weak": 0.6, "similar": 0.4,
+           "old": 0.2}
+
+
+@dataclass
+class ScanResult:
+    rows: list[dict[str, str]]          # entries without their passwords
+    keys: list[str]                     # display key per row, same order
+    hits: dict[str, int]                # key -> times seen in breaches (the password itself)
+    reuse: list[list[str]]
+    dupes: list[str]
+    scanned: int
+    weak: dict[str, str] = field(default_factory=dict)       # key -> why
+    similar: list[list[str]] = field(default_factory=list)
+    old: dict[str, date] = field(default_factory=dict)       # key -> last changed
+    sites: dict[str, object] = field(default_factory=dict)   # key -> breaches.SiteFinding
+    sites_error: str = ""                                    # breach list unavailable
+
+    def problems(self) -> dict[str, str]:
+        """key -> its worst problem kind (as in PENALTY)."""
+        worst: dict[str, str] = {}
+
+        def add(key: str, kind: str) -> None:
+            if key not in worst or PENALTY[kind] > PENALTY[worst[key]]:
+                worst[key] = kind
+        for k in self.hits:
+            add(k, "breached")
+        for k, f in self.sites.items():
+            add(k, "breached" if f.after_change else "sitebreach")
+        for group in self.reuse:
+            for k in group:
+                add(k, "reused")
+        for k in self.weak:
+            add(k, "weak")
+        for group in self.similar:
+            for k in group:
+                add(k, "similar")
+        for k in self.old:
+            add(k, "old")
+        return worst
+
+    @property
+    def score(self) -> int:
+        if not self.scanned:
+            return 100
+        lost = sum(PENALTY[kind] for kind in self.problems().values())
+        return max(0, min(100, round(100 * (1 - lost / self.scanned))))
+
+
+def _day(stamp: str) -> date | None:
+    try:
+        return date.fromisoformat((stamp or "")[:10])
+    except ValueError:
+        return None
+
+
+def scan_full(v: Vault, site_breaches: bool = True) -> ScanResult:
+    """Every check in one vault read. Passwords exist only inside this function."""
+    import breaches
+    import strength
     rows = [r for r in v.export_entries() if not r["Path"].startswith(PENDING_GROUP + "/")]
-    pw, dupes = keyed_passwords(rows)
+    keys, dupes = display_keys(rows)
+    pw = {k: r.get("Password", "") for k, r in zip(keys, rows)}
     hits = pwned_counts(pw)
     reuse = reused(pw)
-    scanned = sum(1 for x in pw.values() if x)
+    weak = {k: why for k, p in pw.items() if p and (why := strength.weakness(p))}
+    similar = strength.similar_groups(pw)
+    has_pw = {k for k, x in pw.items() if x}
+    scanned = len(has_pw)
     for r in rows:  # drop secrets from the rows we keep around
         r.pop("Password", None)
     del pw
-    return rows, hits, reuse, dupes, scanned
+
+    today = date.today()
+    old = {}
+    for k, r in zip(keys, rows):
+        # Last Modified >= the password's real date, so "edited 3+ years ago" is safe to say
+        changed = password_set_on(r) or _day(r.get("Last Modified", ""))
+        if k in has_pw and changed and today - changed >= OLD_AFTER:
+            old[k] = changed
+    sites, error = {}, ""
+    if site_breaches:
+        try:
+            by_path = breaches.match(rows, breaches.load(), password_set_on)
+            sites = {k: by_path[r["Path"]] for k, r in zip(keys, rows)
+                     if r["Path"] in by_path and k in has_pw}
+        except (OSError, ValueError, urllib.error.URLError) as e:
+            error = f"the site breach list couldn't be downloaded ({e})"
+    return ScanResult(rows, keys, hits, reuse, dupes, scanned, weak, similar, old, sites, error)
+
+
+def scan(v: Vault) -> tuple[list[dict[str, str]], dict[str, int], list[list[str]], list[str], int]:
+    """The breach + reuse part only (the older, smaller result `fix` builds on)."""
+    r = scan_full(v, site_breaches=False)
+    return r.rows, r.hits, r.reuse, r.dupes, r.scanned
 
 
 def cmd_check(v: Vault, a: argparse.Namespace) -> int:
-    _, hits, reuse, dupes, scanned = scan(v)
+    res = scan_full(v)
+    hits, reuse, dupes = res.hits, res.reuse, res.dupes
 
-    print(f"vaultkit check — {datetime.now():%Y-%m-%d %H:%M} — {scanned} passwords scanned")
+    print(f"vaultkit check — {datetime.now():%Y-%m-%d %H:%M} — {res.scanned} passwords scanned")
+    print(f"Health score: {res.score}/100")
     if hits:
         print(f"\n✗ {len(hits)} entr{'y' if len(hits) == 1 else 'ies'} in Pwned Passwords:")
         for path, n in sorted(hits.items(), key=lambda kv: (-kv[1], kv[0])):
             print(f"  {n:>10,}×  {path}")
     else:
         print("\n✓ No vault passwords found in Pwned Passwords.")
+    if res.sites:
+        print(f"\n✗ {len(res.sites)} site(s) had a breach that may include your password:")
+        for k, f in sorted(res.sites.items(), key=lambda kv: (not kv[1].after_change, kv[0])):
+            print(f"   - {k}: {f.text()}")
     if reuse:
         print(f"\n! {len(reuse)} reused password group(s):")
         for g in reuse:
             print("   - " + ", ".join(g))
+    if res.weak:
+        print(f"\n! {len(res.weak)} weak password(s):")
+        for k, why in sorted(res.weak.items()):
+            print(f"   - {k}: {why}")
+    if res.similar:
+        print(f"\n! {len(res.similar)} group(s) of near-identical passwords:")
+        for g in res.similar:
+            print("   - " + ", ".join(g))
+    if res.old:
+        print(f"\n· {len(res.old)} password(s) unchanged for 3+ years:")
+        for k, when in sorted(res.old.items(), key=lambda kv: kv[1]):
+            print(f"   - {k} (since {when:%b %Y})")
     if dupes:
         print(f"\n? {len(dupes)} title(s) used by more than one entry (rename them so each is "
               "unique — fix skips these):")
         for d in dupes:
             print(f"   - {d}")
-    if hits or reuse:
+    if res.sites_error:
+        print(f"\nNote: {res.sites_error}; that check was skipped.")
+    if res.problems():
         print("\nTo change them: vaultkit fix")
 
-    write_report(hits, reuse, dupes)
-    return 2 if hits else (1 if reuse else 0)
+    write_report(hits, reuse, dupes, site_breached(res))
+    record_history(res)
+    breached_now = hits or any(f.after_change for f in res.sites.values())
+    return 2 if breached_now else (1 if res.problems() else 0)
 
 
-def write_report(hits: dict[str, int], reuse: list[list[str]], dupes: list[str]) -> Path:
+def site_breached(res: ScanResult) -> list[str]:
+    """Entries whose site was breached after their password was last changed."""
+    return sorted(k for k, f in res.sites.items() if f.after_change)
+
+
+def record_history(res: ScanResult) -> Path:
+    """One point per day (the latest check wins): score and counts, never names or passwords."""
+    path = state_dir() / "history.json"
+    history = load_history()
+    kinds = list(res.problems().values())
+    point = {"at": datetime.now().isoformat(timespec="seconds"), "score": res.score,
+             "scanned": res.scanned, "breached": kinds.count("breached"),
+             "at_risk": len(kinds) - kinds.count("breached")}
+    if history and str(history[-1].get("at", ""))[:10] == point["at"][:10]:
+        history[-1] = point
+    else:
+        history.append(point)
+    history = history[-400:]
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(history), "utf-8")
+    os.replace(tmp, path)
+    return path
+
+
+def load_history() -> list[dict]:
+    try:
+        data = json.loads((state_dir() / "history.json").read_text("utf-8"))
+    except (OSError, ValueError):
+        return []
+    return [h for h in data if isinstance(h, dict) and isinstance(h.get("score"), int)] \
+        if isinstance(data, list) else []
+
+
+def write_report(hits: dict[str, int], reuse: list[list[str]], dupes: list[str],
+                 site_breached: list[str] = ()) -> Path:
     """Entry names + counts only — never secrets. Shared by the CLI and the app."""
     report = {"checked_at": datetime.now(timezone.utc).isoformat(),
-              "breached": hits, "reused": reuse, "duplicates": dupes}
+              "breached": hits, "site_breached": list(site_breached),
+              "reused": reuse, "duplicates": dupes}
     path = state_dir() / "last-check.json"
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
@@ -486,8 +655,13 @@ def start_rotation(v: Vault, entry: str, info: SiteInfo) -> str:
 
 
 def commit_rotation(v: Vault, entry: str) -> None:
+    """Make the pending password the real one, and record today as its date."""
     pend = pending_path(entry)
-    v.set_password(entry, v.attr(pend, "Password"))  # old one stays in entry History
+    notes = v.attr(entry, "Notes")
+    prof = parse_profile(notes) or Profile()
+    prof.changed = date.today().isoformat()
+    # old one stays in entry History
+    v.set_password(entry, v.attr(pend, "Password"), notes=upsert_profile(notes, prof))
     v.rm(pend)
 
 
@@ -536,8 +710,10 @@ FIX_PROMPT = ("  [y] site accepted it AND I logged in with it   [n] site rejecte
 
 
 def cmd_fix(v: Vault, a: argparse.Namespace) -> int:
-    """Walk breached/reused entries: save new pw -> open change page -> confirm -> commit."""
-    rows, hits, reuse, dupes, _ = scan(v)
+    """Walk every entry with a problem (breached first): save new pw -> open change page ->
+    confirm -> commit."""
+    res = scan_full(v)
+    rows, hits, reuse, dupes = res.rows, res.hits, res.reuse, res.dupes
     by_path = {r["Path"]: r for r in rows}
     dupe_set = set(dupes)
 
@@ -546,11 +722,23 @@ def cmd_fix(v: Vault, a: argparse.Namespace) -> int:
     else:
         targets = [(p, f"breached {n:,}×") for p, n in sorted(hits.items(), key=lambda kv: (-kv[1], kv[0]))]
         seen = {p for p, _ in targets}
+
+        def add(p: str, why: str) -> None:
+            if p not in seen:
+                targets.append((p, why))
+                seen.add(p)
+        for p, f in sorted(res.sites.items(), key=lambda kv: (not kv[1].after_change, kv[0])):
+            add(p, f"site breach ({f.breach.title}, {f.breach.breach_date:%b %Y})")
         for group in reuse:
             for p in group:
-                if p not in seen:
-                    targets.append((p, f"reused across {len(group)} entries"))
-                    seen.add(p)
+                add(p, f"reused across {len(group)} entries")
+        for p, why in sorted(res.weak.items()):
+            add(p, "weak")
+        for group in res.similar:
+            for p in group:
+                add(p, "near-identical to another")
+        for p, when in sorted(res.old.items(), key=lambda kv: kv[1]):
+            add(p, f"unchanged since {when:%b %Y}")
     skipped = [p for p, _ in targets if p not in by_path or p in dupe_set
                or p.startswith(PENDING_GROUP + "/")]
     targets = [(p, why) for p, why in targets if p not in skipped]
