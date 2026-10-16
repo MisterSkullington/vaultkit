@@ -38,9 +38,10 @@ vaultkit.py         the command-line tool (same core the app uses)
 vaultkit.cmd        lets you type `vaultkit ...` instead of `py vaultkit.py ...`
 secretstore.py      optional saved password for unattended checks (Windows DPAPI)
 kpsetup.py          finds, installs and sets up KeePassXC (also: py -3.13 kpsetup.py check)
+backup.py           copies of the vault in OneDrive, made when it changes
 breaches.py         which of your sites had a breach, and was it after your last change
 strength.py         weak and near-identical password checks (nothing leaves the PC)
-tests/              127 tests, incl. headless GUI tests against a fake keepassxc-cli;
+tests/              137 tests, incl. headless GUI tests against a fake keepassxc-cli;
                     run on real Windows by GitHub Actions on every push, followed by a
                     real KeePassXC download, signature check, install and vault test
 ```
@@ -83,6 +84,15 @@ Then double-click **Open vaultkit.cmd**. Pin it to Start for quick access (right
     the one KeePassXC screen that fixes it.
   - **KeePassXC-Browser in Opera GX:** opens the extension's page. Adding it, pressing
     *Connect* and naming the connection are yours to do: that handshake is the security boundary.
+- **Names shared by several entries** (say, three `accounts.google.com` logins): vaultkit
+  can't tell them apart, so it can't fix them one by one. Double-click one of those rows and
+  each gets its own name, `accounts.google.com (username)`. Only the names change; the
+  entries, passwords and history stay as they are.
+- **Backups to OneDrive:** whenever the vault changes, vaultkit copies it to
+  `OneDrive\vaultkit backups` (checked against the original, newest 30 kept). It needs no
+  password, because the vault file is already encrypted; OneDrive adds its own version
+  history. Shown, with **Back up now**, on the Setup page. To restore: close KeePassXC, copy
+  the backup you want over `vaultkit\vault\main.kdbx`, and open it as usual.
 - **Create a vault** (*No vault yet? Create one* on the unlock screen): choose where, type a
   master password twice (12+ characters, no common patterns, not in known breaches), and tick
   that it's written on paper. KeePassXC's command-line tool can only make an older-format vault
@@ -192,7 +202,9 @@ publish from it keeps your signing key.
 | `vaultkit rotate list` | Rotations started but not finished |
 | `vaultkit remember` / `vaultkit forget` | Save / delete the master password for unattended checks |
 | `vaultkit shred FILE` | Overwrite and delete an exported CSV |
-| `vaultkit --version` | Should say 1.9.0 |
+| `vaultkit names` | Give entries that share a title their own names |
+| `vaultkit backup [--to FOLDER]` | Copy the vault to OneDrive now (only if it changed) |
+| `vaultkit --version` | Should say 1.10.0 |
 | `py -3.13 kpsetup.py check --db <vault>` | The Setup list, in text |
 | `py -3.13 kpsetup.py install` | Install KeePassXC if needed, then the recommended setup |
 

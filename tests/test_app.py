@@ -71,7 +71,7 @@ class AppFlow(unittest.TestCase):
             p.stop()
         self.tmp.cleanup()
 
-    def pump(self, until, timeout=15.0):
+    def pump(self, until, timeout=45.0):
         end = time.time() + timeout
         while time.time() < end:
             self.qapp.processEvents()

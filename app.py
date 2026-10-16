@@ -38,6 +38,7 @@ from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import autostart  # noqa: E402
+import backup  # noqa: E402
 import kpsetup  # noqa: E402
 import secretstore  # noqa: E402
 import shortcuts  # noqa: E402
@@ -404,7 +405,7 @@ def friendly_error(e: Exception) -> str:
         if "no saved master password" in low:
             return "There's no saved password on this PC. Unlock with your master password."
         return f"KeePassXC reported a problem: {msg}"
-    if isinstance(e, kpsetup.SetupError):
+    if isinstance(e, (kpsetup.SetupError, backup.BackupError)):
         return msg
     if isinstance(e, FileNotFoundError):
         return ("KeePassXC isn't installed, or vaultkit can't find it. Press Setup (bottom of "
@@ -518,8 +519,9 @@ def build_report(res: vk.ScanResult, history: list[dict] | None = None) -> Repor
                             "\n".join(tips)))
     for d in res.dupes:
         n = sum(1 for r in res.rows if r["Path"] == d)
-        issues.append(Issue(d, "samename", f"{n} entries share this name. Rename them in "
-                            "KeePassXC so each can be fixed on its own.", changed.get(d, "")))
+        issues.append(Issue(d, "samename", f"{n} entries share this name, so they can't be "
+                            "fixed one by one. Double-click to give each its own name (adds "
+                            "its username).", changed.get(d, "")))
     issues.sort(key=lambda i: SEVERITY.index(i.kind))  # stable within a kind
 
     kinds = list(res.problems().values())
@@ -972,6 +974,7 @@ class DashboardPage(QWidget):
         self.runner = runner
         self.vault: vk.Vault | None = None
         self.report: Report | None = None
+        self.after_note = ""  # shown once with the next report
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(28, 20, 28, 20)
@@ -1124,7 +1127,9 @@ class DashboardPage(QWidget):
         self.check_btn.setObjectName("" if r and r.fixable else "primary")
         self.check_btn.style().unpolish(self.check_btn)
         self.check_btn.style().polish(self.check_btn)
-        self.hint.setVisible(bool(r and r.fixable))
+        self.hint.setVisible(bool(r and (r.fixable or r.samename)))
+        self.hint.setText("Double-click an entry to fix just that one." if r and r.fixable else
+                          "Double-click a name shared by several entries to give each its own.")
         self.bar.set_report(r)
         self.score.set_report(r)
         self.legend.setVisible(r is not None)
@@ -1144,6 +1149,8 @@ class DashboardPage(QWidget):
         if r.sites_error:
             extra += (" The list of breached websites couldn't be downloaded, so that part "
                       "was skipped this time.")
+        if self.after_note:
+            extra, self.after_note = f" {self.after_note}{extra}", ""
         self.sub.setText(f"Checked {r.scanned} passwords at {r.checked_at:%H:%M}.{extra}")
         self.leg_breached.text.setText(f"Breached {r.breached}")
         self.leg_risk.text.setText(f"At risk {r.at_risk}")
@@ -1185,9 +1192,23 @@ class DashboardPage(QWidget):
         issue = self.report.issues[row]
         if issue.fixable:
             self.fix_requested.emit([issue])
-        else:
-            self.sub.setText(f"{issue.name} can't be fixed from here: rename the entries that "
-                             "share its name in KeePassXC first.")
+        else:  # a name several entries share: give each its own first
+            self.rename_shared(issue.name.split(" [user: ")[0])
+
+    def rename_shared(self, path: str) -> None:
+        """'accounts.google.com' x3 -> 'accounts.google.com (username)' each. Titles only."""
+        v = self.vault
+        if v is None:
+            return
+        self.check_btn.setEnabled(False)
+        self.fix_btn.hide()
+        self.sub.setText(f"Giving each '{path.rsplit('/', 1)[-1]}' entry its own name…")
+        self.runner.submit(lambda: vk.unique_names(v, path), self._renamed, self._check_failed)
+
+    def _renamed(self, renamed: list[str]) -> None:
+        names = ", ".join(n.rsplit("/", 1)[-1] for n in renamed)
+        self.after_note = f"Renamed: {names}. Each can now be fixed on its own."
+        self.start_check()
 
 
 
@@ -1684,12 +1705,13 @@ class SetupPage(QWidget):
         if self.busy:
             return
         self.recheck.setEnabled(False)
-        db = self.db()
-        self.runner.submit(lambda: self._collect(db), self.show_checks, self._failed)
+        db, on, target = self.db(), backups_on(self.settings), backup_target(self.settings)
+        self.runner.submit(lambda: self._collect(db, on, target), self.show_checks, self._failed)
 
     @staticmethod
-    def _collect(db: str) -> list[kpsetup.Check]:
+    def _collect(db: str, backups: bool = True, target: Path | None = None) -> list[kpsetup.Check]:
         checks = kpsetup.run_checks(db or None)
+        checks.insert(len(checks) - 1, backup_check(db, backups, target))
         if autostart.supported():
             on = autostart.is_enabled()
             checks.append(kpsetup.Check(
@@ -1763,6 +1785,14 @@ class SetupPage(QWidget):
             self.autostart_requested.emit()
             self.refresh()
             return
+        if ch.key == "backup":
+            db, target = self.db(), backup_target(self.settings)
+            self.settings.setValue("backups", True)
+            if db and target:
+                self.run_fix(lambda: backup.backup(db, target), "Backing up the vault…")
+            else:
+                self.refresh()
+            return
         jobs = {
             "keepassxc": (self._install, "Getting KeePassXC…"),
             "settings": (kpsetup.apply_settings, "Changing KeePassXC's settings…"),
@@ -1824,6 +1854,37 @@ class SetupPage(QWidget):
         """After creating a vault: the one step left, right in front of the person."""
         self.guide_wanted = True
         self.say("Your vault is created. One more step makes it much harder to crack:")
+
+
+def backups_on(settings: QSettings) -> bool:
+    return settings.value("backups", True, type=bool)
+
+
+def backup_target(settings: QSettings) -> Path | None:
+    raw = (settings.value("backup_dir", "") or "").strip()
+    return Path(raw) if raw else backup.default_target()
+
+
+def backup_check(db: str, on: bool, target: Path | None) -> kpsetup.Check:
+    title = "Backups to OneDrive"
+    if not db or not Path(db).is_file():
+        return kpsetup.Check("backup", title, None, "After you have a vault.")
+    if not on:
+        return kpsetup.Check("backup", title, False, "Off. A copy off this PC keeps your "
+                             "passwords safe if the disk fails.", "Turn on")
+    if target is None:
+        return kpsetup.Check("backup", title, False, "OneDrive isn't set up on this PC. Sign "
+                             "in to OneDrive, then press Check again.")
+    st = backup.status(db, target)
+    fresh = st.last_at is not None and datetime.now() - st.last_at < timedelta(days=1)
+    when = st.last_at.strftime("%d %b at %H:%M").lstrip("0") if st.last_at else ""
+    if st.up_to_date or (fresh and st.count):
+        return kpsetup.Check("backup", title, True,
+                             f"Last copy {when}; {st.count} kept in {target}. Copies are made "
+                             "when the vault changes; the newest 30 are kept.")
+    return kpsetup.Check("backup", title, False,
+                         f"The vault changed since the last copy ({when})." if when else
+                         "No copy yet.", "Back up now")
 
 
 class CreateVaultPage(QWidget):
@@ -2138,9 +2199,11 @@ class MainWindow(QMainWindow):
         self.daily = QTimer(self)
         self.daily.setInterval(60 * 60 * 1000)  # look hourly; runs once it's due (survives sleep)
         self.daily.timeout.connect(self.maybe_daily_check)
+        self.daily.timeout.connect(self.maybe_backup)
         if background:
             self.daily.start()
             QTimer.singleShot(90_000, self.maybe_daily_check)
+            QTimer.singleShot(60_000, self.maybe_backup)
         self.dash.checked.connect(lambda r: self.on_report(r, background=False))
 
         self.idle = QTimer(self)
@@ -2303,6 +2366,16 @@ class MainWindow(QMainWindow):
         except (OSError, ValueError):
             return set()
 
+    def maybe_backup(self) -> None:
+        """Copy the vault to OneDrive if it changed. No password needed: it's encrypted."""
+        db = (self.settings.value("db", "") or "").strip()
+        target = backup_target(self.settings)
+        if not (backups_on(self.settings) and db and target and Path(db).is_file()):
+            return
+        self.net.submit(lambda: backup.backup(db, target),
+                        lambda made: updater.log(f"backed up to {made}") if made else None,
+                        lambda m: updater.log(f"backup failed: {m}"))
+
     def maybe_daily_check(self) -> None:
         if self.daily_enabled and self.check_due():
             self.run_check(explicit=False)
@@ -2427,6 +2500,8 @@ class MainWindow(QMainWindow):
 
     def on_fixed(self, changed: int) -> None:
         self.stack.setCurrentWidget(self.dash)
+        if changed:
+            self.maybe_backup()  # new passwords: copy them off this PC now
         self.dash.start_check()  # show the vault as it is now
 
     # -- setup and new vault

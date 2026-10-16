@@ -44,7 +44,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Iterable
 
-__version__ = "1.9.0"
+__version__ = "1.10.0"
 PENDING_GROUP = "vaultkit-pending"
 SKIP_GROUPS = {"Recycle Bin"}
 HIBP_RANGE_URL = "https://api.pwnedpasswords.com/range/{prefix}"
@@ -308,6 +308,9 @@ class Vault:
     def set_notes(self, entry: str, notes: str) -> None:
         self.run("edit", "--notes", notes, self.db, entry)
 
+    def set_title(self, entry: str, title: str) -> None:
+        self.run("edit", "-t", title, self.db, entry)
+
     def set_password(self, entry: str, pw: str, notes: str | None = None) -> None:
         """New password (and optionally new notes) in one edit, so one unlock."""
         flags = ["--notes", notes] if notes is not None else []
@@ -401,6 +404,30 @@ def display_keys(rows: list[dict[str, str]]) -> tuple[list[str], list[str]]:
         keys.append(key)
         seen.add(key)
     return keys, dupes
+
+
+def unique_names(v: Vault, path: str, rows: list[dict[str, str]] | None = None) -> list[str]:
+    """Give each entry at `path` (several entries sharing one title) its own name,
+    "title (username)", so each can be checked and fixed on its own. Only titles change.
+
+    keepassxc-cli always acts on the FIRST entry at a path, so: read that one's username,
+    rename it, and repeat; the next call then reaches the next entry."""
+    rows = rows if rows is not None else v.export_entries()
+    count = sum(1 for r in rows if r["Path"] == path)
+    taken = {r["Path"] for r in rows}
+    group, _, title = path.rpartition("/")
+    renamed = []
+    for _ in range(count):
+        user = v.attr(path, "UserName").strip()
+        base = f"{title} ({user})" if user else f"{title} (no username)"
+        new, n = base, 2
+        while (f"{group}/{new}" if group else new) in taken:
+            new, n = f"{base} {n}", n + 1
+        v.set_title(path, new)
+        full = f"{group}/{new}" if group else new
+        taken.add(full)
+        renamed.append(full)
+    return renamed
 
 
 OLD_AFTER = timedelta(days=3 * 365)
@@ -536,8 +563,8 @@ def cmd_check(v: Vault, a: argparse.Namespace) -> int:
         for k, when in sorted(res.old.items(), key=lambda kv: kv[1]):
             print(f"   - {k} (since {when:%b %Y})")
     if dupes:
-        print(f"\n? {len(dupes)} title(s) used by more than one entry (rename them so each is "
-              "unique — fix skips these):")
+        print(f"\n? {len(dupes)} title(s) used by more than one entry (fix skips these until "
+              "each has its own name: run 'vaultkit names'):")
         for d in dupes:
             print(f"   - {d}")
     if res.sites_error:
@@ -857,6 +884,33 @@ def shred_file(path: Path, passes: int = 1) -> None:
     tmp.unlink()
 
 
+def cmd_names(v: Vault, a: argparse.Namespace) -> int:
+    rows = [r for r in v.export_entries() if not r["Path"].startswith(PENDING_GROUP + "/")]
+    _, dupes = display_keys(rows)
+    if not dupes:
+        print("Every entry already has its own name.")
+        return 0
+    for d in dupes:
+        for new in unique_names(v, d, rows):
+            print(f"  {d}  ->  {new}")
+    return 0
+
+
+def cmd_backup(a: argparse.Namespace) -> int:
+    import backup
+    target = Path(a.to) if a.to else backup.default_target()
+    if target is None:
+        print("No OneDrive folder on this PC. Choose a folder with --to.", file=sys.stderr)
+        return 1
+    try:
+        made = backup.backup(a.db, target)
+    except backup.BackupError as e:
+        print(e, file=sys.stderr)
+        return 1
+    print(f"Backed up to {made}" if made else f"No changes since the last backup in {target}.")
+    return 0
+
+
 def cmd_shred(_: Vault | None, a: argparse.Namespace) -> int:
     files = [Path(f) for f in a.files]
     missing = [str(f) for f in files if not f.is_file()]
@@ -907,6 +961,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("remember", help="save master password for unattended checks (Windows)")
     sub.add_parser("forget", help="delete the saved master password")
 
+    sub.add_parser("names", help="give entries that share a title their own names")
+    bk = sub.add_parser("backup", help="copy the vault to OneDrive if it changed")
+    bk.add_argument("--to", help="backup folder (default: OneDrive\\vaultkit backups)")
+
     sh = sub.add_parser("shred", help="overwrite + delete files (exported CSVs)")
     sh.add_argument("files", nargs="+")
     sh.add_argument("--passes", type=int, default=1)
@@ -923,6 +981,8 @@ def main(argv: list[str] | None = None) -> int:
     if not a.db:
         print("Set --db or VAULTKIT_DB.", file=sys.stderr)
         return 64
+    if a.cmd == "backup":
+        return cmd_backup(a)
     if a.cmd == "rotate" and a.action != "list" and not a.entry:
         print("rotate start|commit|abort needs an ENTRY path.", file=sys.stderr)
         return 64
@@ -930,7 +990,7 @@ def main(argv: list[str] | None = None) -> int:
               password_cmd=a.password_cmd, use_saved_password=a.use_saved_password)
     try:
         return {"check": cmd_check, "profile": cmd_profile, "rotate": cmd_rotate,
-                "fix": cmd_fix, "remember": cmd_remember}[a.cmd](v, a)
+                "fix": cmd_fix, "remember": cmd_remember, "names": cmd_names}[a.cmd](v, a)
     except CliError as e:
         print(e, file=sys.stderr)
         return 3
