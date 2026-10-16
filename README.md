@@ -13,6 +13,7 @@ C:\Users\<you>\vaultkit\
     app\                this program (updates only ever replace files in here)
     vault\              main.kdbx and KeePassXC's backups of it
     old-downloads\      earlier vaultkit zips
+    source\             your copy of the GitHub repo (releases are signed from here)
 ```
 The vault is deliberately outside `app\`: never delete or replace `app\` with the vault in it.
 
@@ -132,19 +133,24 @@ can't replace it. Someone who got into your GitHub account still couldn't push a
 the app would show a red warning and install nothing. It also refuses older versions, file
 names outside the app folder, and files that don't match the signed manifest.
 
-**One-time setup** (from `vaultkit\app`):
+**One-time setup.** Keep a copy of the repo in the project folder; releases are built and
+signed from it:
 ```powershell
-py -3.13 -m pip install -r requirements.txt
-```
-```powershell
-py -3.13 tools\release.py init --repo YOURNAME/vaultkit
+cd $env:USERPROFILE\vaultkit
+gh repo clone MisterSkullington/vaultkit source
+cd source
+py -3.13 tools\release.py init --repo MisterSkullington/vaultkit
 ```
 
-**Publishing a new version** (when you get new code): extract it anywhere, then from that folder:
+**Publishing a new version** (after new code has been pushed to the repo):
 ```powershell
+cd $env:USERPROFILE\vaultkit\source
+git pull
+git log --oneline -5
 py -3.13 tools\release.py publish --notes "What changed"
 ```
-Publishing needs the GitHub CLI signed in once: `gh auth login`.
+`git log` shows what you're about to sign: only publish changes you expect. Publishing needs
+the GitHub CLI signed in once (`gh auth login`). The app then installs it on its next start.
 
 **Going back:** `py -3.13 launcher.py --rollback` restores the previous version and won't
 reinstall the one you left. The last 3 versions are kept in `%LOCALAPPDATA%\vaultkit\backups`.
