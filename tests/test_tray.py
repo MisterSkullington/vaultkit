@@ -170,6 +170,12 @@ class Window(Base):
         self.win.show_window()
         self.assertTrue(self.win.isVisible())
 
+    def test_version_is_shown(self):
+        v = vk.__version__
+        self.assertEqual(self.win.windowTitle(), f"vaultkit {v}")
+        self.assertEqual([l.text() for l in self.win.version_labels], [f"vaultkit {v}"] * 2)
+        self.assertIs(self.win.version_labels[0].window(), self.win)  # actually on screen
+
     def test_icons_for_each_status(self):
         for status in (None, "ok", "warn", "bad"):
             self.assertFalse(self.appmod.make_icon(status).isNull())

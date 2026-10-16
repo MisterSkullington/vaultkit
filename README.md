@@ -31,7 +31,7 @@ tools/release.py    signs and publishes a release (run on your PC; the key stays
 vaultkit.py         the command-line tool (same core the app uses)
 vaultkit.cmd        lets you type `vaultkit ...` instead of `py vaultkit.py ...`
 secretstore.py      optional saved password for unattended checks (Windows DPAPI)
-tests/              65 tests, incl. headless GUI tests against a fake keepassxc-cli
+tests/              66 tests, incl. headless GUI tests against a fake keepassxc-cli
 ```
 
 Needs: Windows 10/11, KeePassXC (with `C:\Program Files\KeePassXC` on PATH), Python 3.10+. The app needs **64-bit** Python (PySide6 has no 32-bit Windows build); the launcher uses `pyw -3.13`.
@@ -66,6 +66,8 @@ Then double-click **Open vaultkit.cmd**. Pin it to Start for quick access (right
 - **Themes:** *Theme* (top right, or in the tray menu): Match Windows (default), Mist,
   Slate (dark), Ember (dark, warm), Heather, High contrast. All meet WCAG AA contrast.
 - Opening vaultkit while it's already running just brings the existing window forward.
+- **Version:** shown in the window title, at the bottom of the unlock screen and dashboard,
+  and at the top of the tray menu.
 - **Start menu:** the app adds itself the first time it runs: press the Windows key and type
   *vaultkit*. It also keeps *Open vaultkit* in the project folder pointing at the right place,
   with the vaultkit icon and no console window flashing up.
@@ -123,7 +125,7 @@ publish from it keeps your signing key.
 | `vaultkit rotate list` | Rotations started but not finished |
 | `vaultkit remember` / `vaultkit forget` | Save / delete the master password for unattended checks |
 | `vaultkit shred FILE` | Overwrite and delete an exported CSV |
-| `vaultkit --version` | Should say 1.7.0 |
+| `vaultkit --version` | Should say 1.7.1 |
 
 `vaultkit` works from any PowerShell window once this folder is on your PATH (one time):
 ```powershell

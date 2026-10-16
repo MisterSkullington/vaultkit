@@ -555,6 +555,13 @@ class ThemeMenu(QMenu):
         self.actions_by_key.get(key, self.actions_by_key["system"]).setChecked(True)
 
 
+def version_label() -> QLabel:
+    label = QLabel(f"vaultkit {vk.__version__}")
+    label.setObjectName("muted")
+    label.setAccessibleName(f"vaultkit version {vk.__version__}")
+    return label
+
+
 def theme_button(menu: ThemeMenu) -> QPushButton:
     b = QPushButton("Theme \u25BE")
     b.setObjectName("link")
@@ -854,6 +861,8 @@ class DashboardPage(QWidget):
         self.forget_btn.clicked.connect(self.forget_saved)
         foot.addWidget(self.hint, 1)
         foot.addWidget(self.forget_btn)
+        foot.setSpacing(16)
+        self.foot = foot
         lay.addSpacing(12)
         lay.addLayout(foot)
 
@@ -1389,7 +1398,7 @@ class MainWindow(QMainWindow):
     def __init__(self, idle_minutes: float = IDLE_LOCK_MINUTES, startup_note: str = "",
                  check_updates: bool = True, background: bool = True) -> None:
         super().__init__()
-        self.setWindowTitle("vaultkit")
+        self.setWindowTitle(f"vaultkit {vk.__version__}")
         self.setWindowIcon(make_icon())
         self.quitting = False
         self.instance: InstanceServer | None = None
@@ -1419,6 +1428,13 @@ class MainWindow(QMainWindow):
         row.addWidget(theme_button(unlock_menu))
         self.unlock.layout().insertLayout(0, row)
         self.dash.top_bar.insertWidget(1, theme_button(dash_menu))
+        self.version_labels = [version_label(), version_label()]
+        foot = QHBoxLayout()
+        foot.setContentsMargins(28, 0, 28, 16)
+        foot.addStretch(1)
+        foot.addWidget(self.version_labels[0])
+        self.unlock.layout().addLayout(foot)
+        self.dash.foot.addWidget(self.version_labels[1])
         hints = QApplication.styleHints()
         if hasattr(hints, "colorSchemeChanged"):
             hints.colorSchemeChanged.connect(self._system_scheme_changed)
@@ -1498,8 +1514,11 @@ class MainWindow(QMainWindow):
     # -- tray
     def _build_tray(self) -> None:
         self.tray = QSystemTrayIcon(make_icon(), self)
-        self.tray.setToolTip("vaultkit")
+        self.tray.setToolTip(f"vaultkit {vk.__version__}")
         menu = QMenu()
+        header = menu.addAction(f"vaultkit {vk.__version__}")
+        header.setEnabled(False)
+        menu.addSeparator()
         open_act = menu.addAction("Open vaultkit")
         open_act.triggered.connect(self.show_window)
         check_act = menu.addAction("Check now")
@@ -1565,13 +1584,14 @@ class MainWindow(QMainWindow):
             return
         if r is None:
             self.tray.setIcon(make_icon())
-            self.tray.setToolTip("vaultkit")
+            self.tray.setToolTip(f"vaultkit {vk.__version__}")
             return
         status = "bad" if r.breached else ("warn" if r.needs_changing else "ok")
         self.tray.setIcon(make_icon(status))
         summary = (f"{r.needs_changing} need changing" if r.needs_changing
                    else "all passwords look safe")
-        self.tray.setToolTip(f"vaultkit: {summary} (checked {r.checked_at:%a %H:%M})")
+        self.tray.setToolTip(f"vaultkit {vk.__version__}: {summary} "
+                             f"(checked {r.checked_at:%a %H:%M})")
 
     # -- daily check
     @property
