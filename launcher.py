@@ -4,6 +4,7 @@
   pyw -3.13 launcher.py               normal start (what "Open vaultkit.cmd" runs)
   pyw -3.13 launcher.py --tray        start hidden in the tray (Start with Windows uses this)
   py  -3.13 launcher.py --rollback    go back to the previous version and don't reinstall this one
+  py  -3.13 launcher.py --uninstall   remove shortcuts, autostart, saved password (never your vault)
 """
 from __future__ import annotations
 
@@ -26,6 +27,17 @@ def main() -> int:
         print(f"Back on vaultkit {version}. The version you left won't be installed again "
               "automatically; a newer one will.")
         return 0
+
+    if "--uninstall" in sys.argv:
+        from PySide6.QtCore import QCoreApplication, QSettings
+        import app
+        import uninstall
+        QCoreApplication.instance() or QCoreApplication(sys.argv[:1])
+        if app.signal_running_instance(show=False):
+            print("vaultkit is still running. Right-click its tray icon, choose Quit vaultkit, "
+                  "then run this again.")
+            return 1
+        return uninstall.uninstall(HERE, clear_settings=QSettings("vaultkit", "vaultkit").clear)
 
     note = ""
     try:

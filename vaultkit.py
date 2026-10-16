@@ -45,7 +45,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable
 
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 PENDING_GROUP = "vaultkit-pending"
 SKIP_GROUPS = {"Recycle Bin"}
 HIBP_RANGE_URL = "https://api.pwnedpasswords.com/range/{prefix}"

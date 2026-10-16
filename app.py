@@ -12,6 +12,7 @@ from __future__ import annotations
 import getpass
 import json
 import os
+import struct
 import subprocess
 import sys
 import urllib.error
@@ -20,8 +21,9 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import (QEvent, QMimeData, QObject, QRectF, QRunnable, QSettings,
-                            QSize, Qt, QThreadPool, QTimer, QUrl, Signal)
+from PySide6.QtCore import (QBuffer, QByteArray, QEvent, QIODevice, QMimeData, QObject,
+                            QRectF, QRunnable, QSettings, QSize, Qt, QThreadPool, QTimer, QUrl,
+                            Signal)
 from PySide6.QtGui import (QAction, QActionGroup, QColor, QDesktopServices, QIcon, QIntValidator,
                            QPainter, QPainterPath,
                            QPalette, QPixmap)
@@ -37,6 +39,7 @@ from PySide6.QtNetwork import QLocalServer, QLocalSocket
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import autostart  # noqa: E402
 import secretstore  # noqa: E402
+import shortcuts  # noqa: E402
 import updater  # noqa: E402
 import vaultkit as vk  # noqa: E402
 
@@ -217,37 +220,69 @@ class SecretClipboard(QObject):
         self._timer.stop()
 
 
-def make_icon(status: str | None = None) -> QIcon:
+ICON_SIZES = (16, 20, 24, 32, 48, 64, 256)
+
+
+def icon_pixmap(size: int, status: str | None = None) -> QPixmap:
     """Slate tile with the vault bar; a status dot when there's news (bad / warn / ok)."""
-    icon = QIcon()
     dot = ICON_DOT.get(status or "")
-    for size in (16, 20, 24, 32, 48, 64, 256):
-        pm = QPixmap(size, size)
-        pm.fill(Qt.GlobalColor.transparent)
-        p = QPainter(pm)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(ICON_TILE))
-        p.drawRoundedRect(QRectF(0, 0, size, size), size * 0.2, size * 0.2)
-        bar_y, bar_h = size * 0.40, max(size * 0.18, 2.0)
-        x, gap = size * 0.16, max(size * 0.04, 1.0)
-        for frac, alpha in ((0.17, 255), (0.17, 200), (0.66, 150)):
-            w = size * 0.68 * frac
-            c = QColor(ICON_BAR)
-            c.setAlpha(alpha)
-            p.setBrush(c)
-            p.drawRoundedRect(QRectF(x, bar_y, w - gap, bar_h), bar_h / 3, bar_h / 3)
-            x += w
-        if dot:
-            r = size * 0.24
-            p.setBrush(QColor(ICON_BAR))
-            p.drawEllipse(QRectF(size - 2 * r - 1, size - 2 * r - 1, 2 * r + 1, 2 * r + 1))
-            p.setBrush(QColor(dot))
-            p.drawEllipse(QRectF(size - 2 * r + size * 0.04, size - 2 * r + size * 0.04,
-                                 2 * r - size * 0.1, 2 * r - size * 0.1))
-        p.end()
-        icon.addPixmap(pm)
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor(ICON_TILE))
+    p.drawRoundedRect(QRectF(0, 0, size, size), size * 0.2, size * 0.2)
+    bar_y, bar_h = size * 0.40, max(size * 0.18, 2.0)
+    x, gap = size * 0.16, max(size * 0.04, 1.0)
+    for frac, alpha in ((0.17, 255), (0.17, 200), (0.66, 150)):
+        w = size * 0.68 * frac
+        c = QColor(ICON_BAR)
+        c.setAlpha(alpha)
+        p.setBrush(c)
+        p.drawRoundedRect(QRectF(x, bar_y, w - gap, bar_h), bar_h / 3, bar_h / 3)
+        x += w
+    if dot:
+        r = size * 0.24
+        p.setBrush(QColor(ICON_BAR))
+        p.drawEllipse(QRectF(size - 2 * r - 1, size - 2 * r - 1, 2 * r + 1, 2 * r + 1))
+        p.setBrush(QColor(dot))
+        p.drawEllipse(QRectF(size - 2 * r + size * 0.04, size - 2 * r + size * 0.04,
+                             2 * r - size * 0.1, 2 * r - size * 0.1))
+    p.end()
+    return pm
+
+
+def make_icon(status: str | None = None) -> QIcon:
+    icon = QIcon()
+    for size in ICON_SIZES:
+        icon.addPixmap(icon_pixmap(size, status))
     return icon
+
+
+def write_ico(path: Path) -> Path:
+    """A real multi-size Windows .ico (PNG entries) for shortcuts and Explorer."""
+    images = []
+    for size in (16, 24, 32, 48, 64, 256):
+        data = QByteArray()
+        buf = QBuffer(data)
+        buf.open(QIODevice.OpenModeFlag.WriteOnly)
+        icon_pixmap(size).toImage().save(buf, "PNG")
+        buf.close()
+        images.append((size, bytes(data)))
+    header = struct.pack("<HHH", 0, 1, len(images))
+    offset = 6 + 16 * len(images)
+    entries, blobs = b"", b""
+    for size, png in images:
+        dim = size if size < 256 else 0  # 0 means 256 in the ICO format
+        entries += struct.pack("<BBBBHHII", dim, dim, 0, 0, 1, 32, len(png), offset + len(blobs))
+        blobs += png
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_bytes(header + entries + blobs)
+    os.replace(tmp, path)
+    return path
 
 
 # ---------------------------------------------------------------------------- single instance
@@ -1490,6 +1525,18 @@ class MainWindow(QMainWindow):
         self.tray.show()
         autostart.refresh(HERE / "launcher.py")
 
+    def ensure_integration(self) -> None:
+        """Icon file (needs the GUI thread) then Start-menu/folder shortcuts (background)."""
+        if not shortcuts.supported():
+            return
+        try:
+            icon = write_ico(shortcuts.data_dir() / "vaultkit.ico")
+        except OSError as e:
+            updater.log(f"icon not written: {e}")
+            return
+        self.net.submit(lambda: shortcuts.ensure(HERE, icon), lambda _r: None,
+                        lambda m: updater.log(f"shortcuts not updated: {m}"))
+
     def _tray_activated(self, reason) -> None:
         if reason in (QSystemTrayIcon.ActivationReason.Trigger,
                       QSystemTrayIcon.ActivationReason.DoubleClick):
@@ -1762,6 +1809,7 @@ def main(startup_note: str = "", start_hidden: bool = False) -> int:
     w = MainWindow(startup_note=startup_note)
     w.instance = InstanceServer()
     w.instance.show_requested.connect(w.show_window)
+    QTimer.singleShot(1500, w.ensure_integration)
     w.resize(860, 640)
     if w.tray is not None:
         app.setQuitOnLastWindowClosed(False)

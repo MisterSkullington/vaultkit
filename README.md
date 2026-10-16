@@ -24,11 +24,14 @@ launcher.py         starts the app; installs a verified update first if one is w
 Open vaultkit.cmd   double-click to open the app (runs launcher.py)
 updater.py          signed self-updates from your GitHub repo's releases
 autostart.py        "Start with Windows" (per-user Run key, no admin rights)
+shortcuts.py        the Start-menu entry and 'Open vaultkit', kept up to date by the app
+uninstall.py        `launcher.py --uninstall`
+install.ps1         installs vaultkit on another PC from your latest signed release
 tools/release.py    signs and publishes a release (run on your PC; the key stays there)
 vaultkit.py         the command-line tool (same core the app uses)
 vaultkit.cmd        lets you type `vaultkit ...` instead of `py vaultkit.py ...`
 secretstore.py      optional saved password for unattended checks (Windows DPAPI)
-tests/              58 tests, incl. headless GUI tests against a fake keepassxc-cli
+tests/              65 tests, incl. headless GUI tests against a fake keepassxc-cli
 ```
 
 Needs: Windows 10/11, KeePassXC (with `C:\Program Files\KeePassXC` on PATH), Python 3.10+. The app needs **64-bit** Python (PySide6 has no 32-bit Windows build); the launcher uses `pyw -3.13`.
@@ -63,6 +66,36 @@ Then double-click **Open vaultkit.cmd**. Pin it to Start for quick access (right
 - **Themes:** *Theme* (top right, or in the tray menu): Match Windows (default), Mist,
   Slate (dark), Ember (dark, warm), Heather, High contrast. All meet WCAG AA contrast.
 - Opening vaultkit while it's already running just brings the existing window forward.
+- **Start menu:** the app adds itself the first time it runs: press the Windows key and type
+  *vaultkit*. It also keeps *Open vaultkit* in the project folder pointing at the right place,
+  with the vaultkit icon and no console window flashing up.
+
+## Another PC
+
+On your main PC, get your public key (it's not secret):
+```powershell
+py -3.13 tools\release.py show-key
+```
+On the other PC, download `install.ps1` from the repo (github.com/MisterSkullington/vaultkit,
+open the file, *Download raw file*) and run it from a normal PowerShell window:
+```powershell
+powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\Downloads\install.ps1" -PublicKey PASTE_KEY_HERE
+```
+It installs anything missing (64-bit Python, KeePassXC, the two Python packages), downloads
+your latest release, **checks its signature against your key before unpacking anything**, pins
+the key for future updates and starts vaultkit. Your vault isn't downloaded: copy `main.kdbx`
+into `vaultkit\vault` yourself. Only your main PC can publish releases.
+
+## Uninstall
+
+Quit vaultkit from its tray icon, then:
+```powershell
+cd $env:USERPROFILE\vaultkit\app
+py -3.13 launcher.py --uninstall
+```
+It removes Start with Windows, the shortcuts, the saved master password, settings and update
+files, then tells you which folder to delete. It never touches your vault, and on the PC you
+publish from it keeps your signing key.
 - **Fix passwords:** walks through every breached or reused entry, one site at a time
   (double-click a row to fix just that one):
   1. a new password is made and **saved in your vault first**, then copied for 45 s
@@ -90,7 +123,7 @@ Then double-click **Open vaultkit.cmd**. Pin it to Start for quick access (right
 | `vaultkit rotate list` | Rotations started but not finished |
 | `vaultkit remember` / `vaultkit forget` | Save / delete the master password for unattended checks |
 | `vaultkit shred FILE` | Overwrite and delete an exported CSV |
-| `vaultkit --version` | Should say 1.6.0 |
+| `vaultkit --version` | Should say 1.7.0 |
 
 `vaultkit` works from any PowerShell window once this folder is on your PATH (one time):
 ```powershell

@@ -55,14 +55,19 @@ def registry():
     return _registry
 
 
-def command(launcher: Path) -> str:
-    """pythonw (no console window) + launcher.py --tray (start hidden in the tray)."""
+def pythonw() -> Path:
+    """The interpreter that runs without a console window (pythonw.exe beside python.exe)."""
     exe = Path(sys.executable)
     if exe.name.lower() == "python.exe":
         windowless = exe.with_name("pythonw.exe")
         if windowless.exists():
-            exe = windowless
-    return f'"{exe}" "{Path(launcher).resolve()}" --tray'
+            return windowless
+    return exe
+
+
+def command(launcher: Path) -> str:
+    """pythonw (no console window) + launcher.py --tray (start hidden in the tray)."""
+    return f'"{pythonw()}" "{Path(launcher).resolve()}" --tray'
 
 
 def is_enabled() -> bool:
