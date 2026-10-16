@@ -1,0 +1,1315 @@
+#!/usr/bin/env python3
+"""vaultkit app — a password-health dashboard on top of your KeePassXC vault.
+
+KeePassXC stays the database (and the place you view/edit passwords). This window shows
+which passwords are breached or reused. All vault access goes through keepassxc-cli via the
+same core as the command-line tool; every slow call runs off the UI thread.
+
+Run on Windows without a console window:  pyw app.py
+"""
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import urllib.error
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Callable
+
+from PySide6.QtCore import (QEvent, QMimeData, QObject, QRectF, QRunnable, QSettings,
+                            QSize, Qt, QThreadPool, QTimer, QUrl, Signal)
+from PySide6.QtGui import (QColor, QDesktopServices, QIcon, QIntValidator, QPainter,
+                           QPainterPath,
+                           QPalette, QPixmap)
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox,
+                               QFileDialog, QFormLayout,
+                               QScrollArea,
+                               QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+                               QMainWindow, QPushButton, QSizePolicy, QStackedWidget,
+                               QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import secretstore  # noqa: E402
+import updater  # noqa: E402
+import vaultkit as vk  # noqa: E402
+
+HERE = Path(__file__).resolve().parent
+UPDATE_CHECK_HOURS = 24
+
+IDLE_LOCK_MINUTES = 5
+
+# ---------------------------------------------------------------------------- design tokens
+PAPER = "#EEF1F4"     # cool mist: window background
+SURFACE = "#FFFFFF"   # inputs, table
+INK = "#1C2733"       # deep slate text
+MUTED = "#5B6B7A"     # secondary text
+LINE = "#D5DCE3"      # hairlines
+BREACHED = "#B3261E"  # brick red: found in breaches
+REUSED = "#B7791F"    # ochre: same password elsewhere
+SAMENAME = "#5A5FA8"  # indigo: ambiguous title (can't be fixed automatically)
+SAFE = "#2E7D5B"      # pine: nothing found
+FOCUS = "#2F5D8A"     # keyboard focus ring / primary button
+
+FAMILY = "Segoe UI Variable Text"
+DISPLAY = "Segoe UI Variable Display"
+
+STYLE = f"""
+QWidget {{ color: {INK}; font-family: "{FAMILY}", "Segoe UI", sans-serif; font-size: 10pt; }}
+QMainWindow, #page {{ background: {PAPER}; }}
+QLabel#muted {{ color: {MUTED}; }}
+QLabel#title {{ font-family: "{DISPLAY}", "Segoe UI", sans-serif; font-size: 20pt;
+                font-weight: 600; }}
+QLabel#verdict {{ font-family: "{DISPLAY}", "Segoe UI", sans-serif; font-size: 28pt;
+                  font-weight: 600; }}
+QLabel#error {{ color: {BREACHED}; }}
+QLineEdit {{ background: {SURFACE}; border: 1px solid {LINE}; border-radius: 6px;
+             padding: 7px 9px; selection-background-color: {FOCUS}; }}
+QLineEdit:focus {{ border: 2px solid {FOCUS}; padding: 6px 8px; }}
+QPushButton {{ background: {SURFACE}; border: 1px solid {LINE}; border-radius: 6px;
+               padding: 7px 14px; }}
+QPushButton:hover {{ border-color: {MUTED}; }}
+QPushButton:focus {{ border: 2px solid {FOCUS}; padding: 6px 13px; }}
+QPushButton:disabled {{ color: {MUTED}; background: {PAPER}; }}
+QPushButton#primary {{ background: {FOCUS}; color: white; border: 1px solid {FOCUS}; }}
+QPushButton#primary:hover {{ background: #264D73; }}
+QPushButton#primary:focus {{ border: 2px solid {INK}; }}
+QPushButton#primary:disabled {{ background: #9FB3C8; border-color: #9FB3C8; }}
+QPushButton#link {{ background: transparent; border: none; color: {FOCUS}; padding: 2px 0;
+                    text-align: left; }}
+QPushButton#link:hover {{ text-decoration: underline; }}
+QPushButton#link:focus {{ border: none; text-decoration: underline; }}
+QTableWidget {{ background: {SURFACE}; border: 1px solid {LINE}; border-radius: 6px;
+                gridline-color: transparent; selection-background-color: #DCE6F0;
+                selection-color: {INK}; }}
+QTableWidget {{ outline: 0; }}
+QTableWidget:focus {{ border: 2px solid {FOCUS}; }}
+QTableWidget::item {{ padding: 6px 8px; border-bottom: 1px solid {PAPER}; }}
+QTableWidget::item:focus {{ border: none; border-bottom: 1px solid {PAPER}; }}
+QHeaderView::section {{ background: {SURFACE}; color: {MUTED}; border: none;
+                        border-bottom: 1px solid {LINE}; padding: 8px; font-weight: 600; }}
+QCheckBox {{ spacing: 8px; }}
+QLabel#step {{ font-weight: 600; }}
+QWidget#banner {{ background: #DCE6F0; border-bottom: 1px solid {LINE}; }}
+QWidget#banner[warn="true"] {{ background: #F6E3E1; }}
+QLabel#ok {{ color: {SAFE}; }}
+QLineEdit#secret {{ font-family: "Cascadia Mono", "Consolas", monospace; font-size: 11pt; }}
+QWidget#rules {{ background: {SURFACE}; border: 1px solid {LINE}; border-radius: 6px; }}
+QScrollArea#scroll, QWidget#scrollbody {{ background: {PAPER}; border: none; }}
+"""
+
+
+def swatch(color: str, w: int = 10, h: int = 10) -> QIcon:
+    pm = QPixmap(w, h)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setBrush(QColor(color))
+    p.setPen(Qt.PenStyle.NoPen)
+    p.drawRoundedRect(0, 0, w, h, 3, 3)
+    p.end()
+    return QIcon(pm)
+
+
+def open_link(url: str) -> None:
+    QDesktopServices.openUrl(QUrl(url))
+
+
+class SecretClipboard(QObject):
+    """Copy a secret, keep it out of Windows clipboard history/cloud sync, auto-clear."""
+    SECONDS = 45
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._value: str | None = None
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self.clear)
+
+    def copy(self, value: str) -> None:
+        mime = QMimeData()
+        mime.setText(value)
+        # Same opt-outs KeePassXC uses; ignored on non-Windows platforms.
+        win = 'application/x-qt-windows-mime;value="{}"'
+        mime.setData(win.format("ExcludeClipboardContentFromMonitorProcessing"), b"\x00")
+        mime.setData(win.format("CanIncludeInClipboardHistory"), b"\x00\x00\x00\x00")
+        mime.setData(win.format("CanUploadToCloudClipboard"), b"\x00\x00\x00\x00")
+        QApplication.clipboard().setMimeData(mime)
+        self._value = value
+        self._timer.start(self.SECONDS * 1000)
+
+    def clear(self) -> None:
+        """Only wipe the clipboard if it still holds what we put there."""
+        cb = QApplication.clipboard()
+        if self._value is not None and cb.text() == self._value:
+            cb.clear()
+        self._value = None
+        self._timer.stop()
+
+
+# ---------------------------------------------------------------------------- background jobs
+class _Signals(QObject):
+    done = Signal(object)
+    failed = Signal(str)
+
+
+class Job(QRunnable):
+    def __init__(self, fn: Callable[[], object]):
+        super().__init__()
+        self.fn = fn
+        self.signals = _Signals()
+
+    def run(self) -> None:
+        try:
+            result = self.fn()
+        except Exception as e:  # surfaced to the UI as a plain-language message
+            self.signals.failed.emit(friendly_error(e))
+            return
+        self.signals.done.emit(result)
+
+
+class Runner(QObject):
+    """One worker thread: keepassxc-cli calls never overlap, so the vault file is never
+    written by two of our processes at once."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.pool = QThreadPool()
+        self.pool.setMaxThreadCount(1)
+        self._live: set[Job] = set()
+
+    def submit(self, fn: Callable[[], object], on_done: Callable[[object], None],
+               on_fail: Callable[[str], None]) -> None:
+        job = Job(fn)
+        self._live.add(job)
+
+        def finish(cb, arg):
+            self._live.discard(job)
+            cb(arg)
+
+        job.signals.done.connect(lambda r: finish(on_done, r))
+        job.signals.failed.connect(lambda m: finish(on_fail, m))
+        self.pool.start(job)
+
+    def wait(self) -> None:
+        self.pool.waitForDone()
+
+
+def friendly_error(e: Exception) -> str:
+    msg = str(e)
+    low = msg.lower()
+    if isinstance(e, vk.CliError):
+        if "invalid credentials" in low or "wrong master password" in low or "hmac" in low:
+            return "That password doesn't open this vault. Check Caps Lock and try again."
+        if "not found" in low or "no such file" in low or "failed to open" in low:
+            return "Can't find the vault file. Check the path, or use Browse to pick it."
+        if "no saved master password" in low:
+            return "There's no saved password on this PC. Unlock with your master password."
+        return f"KeePassXC reported a problem: {msg}"
+    if isinstance(e, FileNotFoundError):
+        return ("Can't find keepassxc-cli. Install KeePassXC, then make sure "
+                "C:\\Program Files\\KeePassXC is on your PATH.")
+    if isinstance(e, urllib.error.URLError):
+        return ("Couldn't reach the breach database (api.pwnedpasswords.com). "
+                "Check your internet connection, then press Check now.")
+    if isinstance(e, updater.UpdateError):
+        return str(e)
+    if isinstance(e, secretstore.SecretStoreError):
+        return f"Windows couldn't read the saved password: {msg}. Unlock with your master password."
+    return f"Something went wrong: {msg}"
+
+
+# ---------------------------------------------------------------------------- report model
+@dataclass
+class Issue:
+    name: str
+    kind: str          # "breached" | "reused" | "samename"
+    problem: str
+    changed: str = ""
+    tooltip: str = ""
+
+    @property
+    def color(self) -> str:
+        return {"breached": BREACHED, "reused": REUSED, "samename": SAMENAME}[self.kind]
+
+    @property
+    def fixable(self) -> bool:
+        """Entries that share a title can't be addressed safely by path."""
+        return self.kind != "samename" and " [user: " not in self.name
+
+
+@dataclass
+class Report:
+    scanned: int
+    breached: int
+    reused: int        # reused but not breached
+    samename: int
+    issues: list[Issue] = field(default_factory=list)
+    checked_at: datetime = field(default_factory=datetime.now)
+    rows: dict[str, dict[str, str]] = field(default_factory=dict)  # by path, no passwords
+
+    @property
+    def fixable(self) -> list[Issue]:
+        return [i for i in self.issues if i.fixable]
+
+    @property
+    def safe(self) -> int:
+        return max(self.scanned - self.breached - self.reused, 0)
+
+    @property
+    def needs_changing(self) -> int:
+        return self.breached + self.reused
+
+
+def build_report(rows: list[dict[str, str]], hits: dict[str, int], reuse: list[list[str]],
+                 dupes: list[str], scanned: int) -> Report:
+    changed = {r["Path"]: (r.get("Last Modified") or "")[:10] for r in rows}
+
+    def when(key: str) -> str:
+        return changed.get(key.split(" [user: ")[0], "")
+
+    issues: dict[str, Issue] = {}
+    for key, n in sorted(hits.items(), key=lambda kv: (-kv[1], kv[0])):
+        issues[key] = Issue(key, "breached", f"Found in {n:,} known breaches.", when(key))
+    reused_only = 0
+    for group in reuse:
+        for key in group:
+            others = [k for k in group if k != key]
+            text = (f"Same password as {len(others)} other "
+                    f"{'entry' if len(others) == 1 else 'entries'}")
+            tip = "Also used by: " + ", ".join(others)
+            if key in issues:
+                issues[key].problem += f" {text}."
+                issues[key].tooltip = tip
+            else:
+                issues[key] = Issue(key, "reused", f"{text}.", when(key), tip)
+                reused_only += 1
+    for d in dupes:
+        n = sum(1 for r in rows if r["Path"] == d)
+        issues.setdefault(f"{d} (name)", Issue(
+            d, "samename", f"{n} entries share this name. Rename them in KeePassXC so each "
+            "can be fixed on its own.", changed.get(d, "")))
+    order = {"breached": 0, "reused": 1, "samename": 2}
+    ranked = sorted(issues.values(), key=lambda i: order[i.kind])
+    return Report(scanned, len(hits), reused_only, len(dupes), ranked,
+                  rows={r["Path"]: r for r in rows})
+
+
+# ---------------------------------------------------------------------------- widgets
+class HealthBar(QWidget):
+    """The vault in one line: safe / reused / breached, proportional to entry counts."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.segments: list[tuple[int, str]] = []
+        self.setMinimumHeight(14)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setAccessibleName("Vault health bar")
+
+    def sizeHint(self) -> QSize:
+        return QSize(400, 14)
+
+    def set_report(self, r: Report | None) -> None:
+        self.segments = [] if r is None else [
+            (r.breached, BREACHED), (r.reused, REUSED), (r.safe, SAFE)]
+        if r:
+            self.setAccessibleDescription(
+                f"{r.breached} breached, {r.reused} reused, {r.safe} safe")
+        self.update()
+
+    def paintEvent(self, _event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRectF(self.rect())
+        clip = QPainterPath()
+        clip.addRoundedRect(rect, 7, 7)
+        p.setClipPath(clip)
+        p.fillRect(rect, QColor(LINE))
+        total = sum(n for n, _ in self.segments)
+        if total:
+            x, gap = rect.left(), 2.0
+            visible = [(n, c) for n, c in self.segments if n]
+            for i, (n, c) in enumerate(visible):
+                w = rect.width() * n / total
+                seg = QRectF(x, rect.top(), max(w - (gap if i < len(visible) - 1 else 0), 3),
+                             rect.height())
+                p.fillRect(seg, QColor(c))
+                x += w
+        p.end()
+
+
+class NumberField(QLineEdit):
+    """Whole numbers in a range, styled exactly like every other text box."""
+
+    def __init__(self, lo: int, hi: int) -> None:
+        super().__init__()
+        self.lo, self.hi = lo, hi
+        self.setValidator(QIntValidator(lo, hi, self))
+        self.setMaximumWidth(90)
+
+    def value(self) -> int:
+        try:
+            return min(max(int(self.text()), self.lo), self.hi)
+        except ValueError:
+            return self.lo
+
+    def setValue(self, n: int) -> None:
+        self.setText(str(n))
+
+
+class LegendItem(QWidget):
+    def __init__(self, color: str, label: str) -> None:
+        super().__init__()
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+        dot = QLabel()
+        dot.setPixmap(swatch(color).pixmap(10, 10))
+        self.text = QLabel(label)
+        self.text.setObjectName("muted")
+        lay.addWidget(dot)
+        lay.addWidget(self.text)
+
+
+# ---------------------------------------------------------------------------- pages
+class UnlockPage(QWidget):
+    unlocked = Signal(object)  # vk.Vault
+
+    def __init__(self, runner: Runner, settings: QSettings) -> None:
+        super().__init__()
+        self.setObjectName("page")
+        self.runner, self.settings = runner, settings
+
+        outer = QVBoxLayout(self)
+        outer.addStretch(2)
+        col = QWidget()
+        col.setMaximumWidth(440)
+        lay = QVBoxLayout(col)
+        lay.setSpacing(10)
+
+        title = QLabel("Unlock your vault")
+        title.setObjectName("title")
+        self.note = QLabel("Your passwords stay in KeePassXC. This window checks them for "
+                           "breaches and reuse.")
+        self.note.setObjectName("muted")
+        self.note.setWordWrap(True)
+        lay.addWidget(title)
+        lay.addWidget(self.note)
+        lay.addSpacing(8)
+
+        lay.addWidget(QLabel("Vault file"))
+        row = QHBoxLayout()
+        self.db = QLineEdit(settings.value("db", os.environ.get("VAULTKIT_DB", "")))
+        self.db.setPlaceholderText(r"C:\Users\you\Vault\main.kdbx")
+        browse = QPushButton("Browse…")
+        browse.clicked.connect(self.browse_db)
+        row.addWidget(self.db, 1)
+        row.addWidget(browse)
+        lay.addLayout(row)
+
+        lay.addWidget(QLabel("Master password"))
+        self.pw = QLineEdit()
+        self.pw.setEchoMode(QLineEdit.EchoMode.Password)
+        self.pw.returnPressed.connect(self.unlock_with_password)
+        self.pw.setAccessibleName("Master password")
+        lay.addWidget(self.pw)
+
+        self.key_toggle = QPushButton("Use a key file too")
+        self.key_toggle.setObjectName("link")
+        self.key_toggle.clicked.connect(self.show_key_file)
+        self.key_row = QWidget()
+        kr = QHBoxLayout(self.key_row)
+        kr.setContentsMargins(0, 0, 0, 0)
+        self.key = QLineEdit(settings.value("key_file", ""))
+        self.key.setPlaceholderText("Key file (optional)")
+        kb = QPushButton("Browse…")
+        kb.clicked.connect(self.browse_key)
+        kr.addWidget(self.key, 1)
+        kr.addWidget(kb)
+        self.key_row.setVisible(bool(self.key.text()))
+        self.key_toggle.setVisible(not self.key.text())
+        lay.addWidget(self.key_toggle)
+        lay.addWidget(self.key_row)
+
+        self.remember = QCheckBox("Remember on this PC for daily checks")
+        self.remember.setEnabled(secretstore.supported())
+        self.remember_note = QLabel(
+            "Encrypted to your Windows login. Programs running as you could read it."
+            if secretstore.supported() else "Only available on Windows.")
+        self.remember_note.setObjectName("muted")
+        self.remember_note.setWordWrap(True)
+        lay.addWidget(self.remember)
+        lay.addWidget(self.remember_note)
+
+        self.error = QLabel()
+        self.error.setObjectName("error")
+        self.error.setWordWrap(True)
+        self.error.hide()
+        lay.addWidget(self.error)
+
+        self.go = QPushButton("Unlock")
+        self.go.setObjectName("primary")
+        self.go.clicked.connect(self.unlock_with_password)
+        self.saved = QPushButton("Unlock with saved password")
+        self.saved.clicked.connect(self.unlock_with_saved)
+        btns = QHBoxLayout()
+        btns.addWidget(self.go)
+        btns.addWidget(self.saved)
+        btns.addStretch(1)
+        lay.addSpacing(4)
+        lay.addLayout(btns)
+
+        h = QHBoxLayout()
+        h.addStretch(1)
+        h.addWidget(col, 3)
+        h.addStretch(1)
+        outer.addLayout(h)
+        outer.addStretch(3)
+        self.refresh()
+
+    def refresh(self, message: str = "") -> None:
+        self.saved.setVisible(secretstore.supported() and secretstore.is_saved())
+        self.remember.setChecked(False)
+        self.set_busy(False)
+        self.show_error(message) if message else self.error.hide()
+        # cursor in the first empty field once the window is actually shown
+        QTimer.singleShot(0, lambda: (self.pw if self.db.text() else self.db).setFocus())
+
+    def show_key_file(self) -> None:
+        self.key_toggle.hide()
+        self.key_row.show()
+        self.key.setFocus()
+
+    def browse_db(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Choose your vault", self.db.text(),
+                                              "KeePass databases (*.kdbx)")
+        if path:
+            self.db.setText(os.path.normpath(path))
+
+    def browse_key(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Choose your key file", self.key.text())
+        if path:
+            self.key.setText(os.path.normpath(path))
+
+    def show_error(self, msg: str) -> None:
+        self.error.setText(msg)
+        self.error.show()
+
+    def set_busy(self, busy: bool, label: str = "Unlocking…") -> None:
+        for w in (self.go, self.saved, self.db, self.pw, self.key, self.remember):
+            w.setEnabled(not busy and (w is not self.remember or secretstore.supported()))
+        self.go.setText(label if busy else "Unlock")
+
+    def _vault(self, **kw) -> vk.Vault | None:
+        db = self.db.text().strip().strip('"')
+        if not db:
+            self.show_error("Choose your vault file first.")
+            return None
+        return vk.Vault(db=db, key_file=self.key.text().strip().strip('"') or None, **kw)
+
+    def unlock_with_password(self) -> None:
+        if not self.pw.text():
+            self.show_error("Type your master password.")
+            return
+        v = self._vault()
+        if not v:
+            return
+        v.set_secret(self.pw.text())
+        remember = self.remember.isChecked()
+        self.pw.clear()
+
+        def work():
+            v.verify()  # never remember a password that doesn't open the vault
+            if remember:
+                secretstore.save(v._pw or "")
+            return v
+
+        self._start(work)
+
+    def unlock_with_saved(self) -> None:
+        v = self._vault(use_saved_password=True)
+        if v:
+            self._start(lambda: (v.unlock(), v.verify(), v)[-1])
+
+    def _start(self, work: Callable[[], object]) -> None:
+        self.error.hide()
+        self.set_busy(True)
+        self.runner.submit(work, self._ok, self._fail)
+
+    def _ok(self, v: vk.Vault) -> None:
+        self.settings.setValue("db", v.db)
+        self.settings.setValue("key_file", v.key_file or "")
+        self.set_busy(False)
+        self.unlocked.emit(v)
+
+    def _fail(self, msg: str) -> None:
+        self.set_busy(False)
+        self.show_error(msg)
+        self.pw.setFocus()
+
+
+class DashboardPage(QWidget):
+    lock_requested = Signal()
+    fix_requested = Signal(list)  # list[Issue]
+
+    def __init__(self, runner: Runner) -> None:
+        super().__init__()
+        self.setObjectName("page")
+        self.runner = runner
+        self.vault: vk.Vault | None = None
+        self.report: Report | None = None
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(28, 20, 28, 20)
+        lay.setSpacing(0)
+
+        top = QHBoxLayout()
+        self.dbname = QLabel()
+        self.dbname.setObjectName("muted")
+        self.lock_btn = QPushButton("Lock")
+        self.lock_btn.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.lock_btn.clicked.connect(self.lock_requested.emit)
+        self.check_btn = QPushButton("Check now")
+        self.check_btn.clicked.connect(self.start_check)
+        self.fix_btn = QPushButton("Fix passwords")
+        self.fix_btn.setObjectName("primary")
+        self.fix_btn.clicked.connect(self.fix_all)
+        self.fix_btn.hide()
+        top.addWidget(self.dbname, 1)
+        top.addWidget(self.lock_btn)
+        top.addWidget(self.check_btn)
+        top.addWidget(self.fix_btn)
+        lay.addLayout(top)
+        lay.addSpacing(26)
+
+        self.verdict = QLabel()
+        self.verdict.setObjectName("verdict")
+        self.verdict.setWordWrap(True)
+        self.sub = QLabel()
+        self.sub.setObjectName("muted")
+        self.sub.setWordWrap(True)
+        lay.addWidget(self.verdict)
+        lay.addSpacing(4)
+        lay.addWidget(self.sub)
+        lay.addSpacing(16)
+
+        self.bar = HealthBar()
+        lay.addWidget(self.bar)
+        lay.addSpacing(10)
+        leg = QHBoxLayout()
+        leg.setSpacing(18)
+        self.leg_breached = LegendItem(BREACHED, "")
+        self.leg_reused = LegendItem(REUSED, "")
+        self.leg_safe = LegendItem(SAFE, "")
+        for w in (self.leg_breached, self.leg_reused, self.leg_safe):
+            leg.addWidget(w)
+        leg.addStretch(1)
+        self.legend = QWidget()
+        self.legend.setLayout(leg)
+        lay.addWidget(self.legend)
+        lay.addSpacing(22)
+
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["Entry", "Problem", "Last changed"])
+        self.table.verticalHeader().hide()
+        self.table.setShowGrid(False)
+        self.table.setWordWrap(True)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        hh = self.table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.table.setColumnWidth(0, 220)
+        self.table.cellDoubleClicked.connect(self.fix_row)
+        lay.addWidget(self.table, 1)
+
+        self.empty = QLabel()
+        self.empty.setObjectName("muted")
+        self.empty.setWordWrap(True)
+        self.empty.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        lay.addWidget(self.empty, 1)
+
+        foot = QHBoxLayout()
+        self.hint = QLabel("Double-click an entry to fix just that one.")
+        self.hint.setObjectName("muted")
+        self.hint.setWordWrap(True)
+        self.forget_btn = QPushButton("Forget saved password")
+        self.forget_btn.setObjectName("link")
+        self.forget_btn.clicked.connect(self.forget_saved)
+        foot.addWidget(self.hint, 1)
+        foot.addWidget(self.forget_btn)
+        lay.addSpacing(12)
+        lay.addLayout(foot)
+
+    # -- lifecycle
+    def open(self, v: vk.Vault) -> None:
+        self.vault = v
+        self.dbname.setText(Path(v.db).name)
+        self.forget_btn.setVisible(secretstore.supported() and secretstore.is_saved())
+        self.show_report(None)
+        self.start_check()
+        QTimer.singleShot(0, self.check_btn.setFocus)
+
+    def close_vault(self) -> None:
+        if self.vault:
+            self.vault.lock()
+        self.vault = None
+        self.show_report(None)
+
+    # -- check
+    def start_check(self) -> None:
+        if not self.vault:
+            return
+        v = self.vault
+        self.check_btn.setEnabled(False)
+        self.fix_btn.hide()
+        self.check_btn.setText("Checking…")
+        self.verdict.setText("Checking your vault…")
+        self.sub.setText("Reading entries through KeePassXC, then checking each password "
+                         "against known breaches. Only the first 5 characters of each "
+                         "password's hash leave this PC.")
+
+        def work() -> Report:
+            rows, hits, reuse, dupes, scanned = vk.scan(v)
+            vk.write_report(hits, reuse, dupes)
+            return build_report(rows, hits, reuse, dupes, scanned)
+
+        self.runner.submit(work, self._checked, self._check_failed)
+
+    def _checked(self, r: Report) -> None:
+        self.check_btn.setEnabled(True)
+        self.check_btn.setText("Check now")
+        if self.vault is None:  # locked while the check was running
+            return
+        self.show_report(r)
+        (self.fix_btn if r.fixable else self.check_btn).setFocus()
+
+    def _check_failed(self, msg: str) -> None:
+        self.check_btn.setEnabled(True)
+        self.check_btn.setText("Check now")
+        self.verdict.setText("The check didn't finish")
+        self.sub.setText(msg)
+
+    # -- render
+    def show_report(self, r: Report | None) -> None:
+        self.report = r
+        self.fix_btn.setVisible(bool(r and r.fixable))
+        self.check_btn.setObjectName("" if r and r.fixable else "primary")
+        self.check_btn.style().unpolish(self.check_btn)
+        self.check_btn.style().polish(self.check_btn)
+        self.hint.setVisible(bool(r and r.fixable))
+        self.bar.set_report(r)
+        self.legend.setVisible(r is not None)
+        self.table.setRowCount(0)
+        if r is None:
+            self.verdict.setText("")
+            self.sub.setText("")
+            self.table.hide()
+            self.empty.hide()
+            return
+        n = r.needs_changing
+        self.verdict.setText(
+            f"All {r.scanned} passwords look safe" if n == 0 else
+            f"{n} password{'s' if n != 1 else ''} need{'' if n != 1 else 's'} changing")
+        extra = (f" {r.samename} name{'s are' if r.samename != 1 else ' is'} shared by more "
+                 "than one entry." if r.samename else "")
+        self.sub.setText(f"Checked {r.scanned} passwords at {r.checked_at:%H:%M}.{extra}")
+        self.leg_breached.text.setText(f"Breached {r.breached}")
+        self.leg_reused.text.setText(f"Reused {r.reused}")
+        self.leg_safe.text.setText(f"Safe {r.safe}")
+
+        if not r.issues:
+            self.table.hide()
+            self.empty.setText("Nothing to fix. The daily check will tell you if that changes.")
+            self.empty.show()
+            return
+        self.empty.hide()
+        self.table.show()
+        self.table.setRowCount(len(r.issues))
+        for row, issue in enumerate(r.issues):
+            name = QTableWidgetItem(swatch(issue.color), issue.name)
+            name.setToolTip(issue.name)
+            prob = QTableWidgetItem(issue.problem)
+            if issue.tooltip:
+                prob.setToolTip(issue.tooltip)
+            when = QTableWidgetItem(issue.changed or "—")
+            for item in (name, prob, when):
+                item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            self.table.setItem(row, 0, name)
+            self.table.setItem(row, 1, prob)
+            self.table.setItem(row, 2, when)
+        self.table.resizeRowsToContents()
+
+    def forget_saved(self) -> None:
+        secretstore.forget()
+        self.forget_btn.hide()
+
+    def fix_all(self) -> None:
+        if self.report and self.report.fixable:
+            self.fix_requested.emit(self.report.fixable)
+
+    def fix_row(self, row: int, _col: int = 0) -> None:
+        if not self.report or row >= len(self.report.issues):
+            return
+        issue = self.report.issues[row]
+        if issue.fixable:
+            self.fix_requested.emit([issue])
+        else:
+            self.sub.setText(f"{issue.name} can't be fixed from here: rename the entries that "
+                             "share its name in KeePassXC first.")
+
+
+
+class FixPage(QWidget):
+    """One site at a time: new password saved first, change it on the site, confirm."""
+    finished = Signal(int)  # passwords changed
+
+    TWOFA = [("none", "None"), ("totp", "Authenticator app"), ("sms", "Text message"),
+             ("email", "Email code"), ("webauthn", "Security key or passkey")]
+
+    def __init__(self, runner: Runner, clipboard: SecretClipboard) -> None:
+        super().__init__()
+        self.setObjectName("page")
+        self.runner, self.clip = runner, clipboard
+        self.vault: vk.Vault | None = None
+        self.queue: list[Issue] = []
+        self.rows: dict[str, dict[str, str]] = {}
+        self.idx = 0
+        self.changed = 0
+        self.url = ""
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setObjectName("scroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        body = QWidget()
+        body.setObjectName("scrollbody")
+        scroll.setWidget(body)
+        outer.addWidget(scroll)
+        lay = QVBoxLayout(body)
+        lay.setContentsMargins(28, 20, 28, 20)
+        lay.setSpacing(0)
+
+        top = QHBoxLayout()
+        self.back = QPushButton("Back to overview")
+        self.back.setObjectName("link")
+        self.back.clicked.connect(self.finish)
+        self.progress = QLabel()
+        self.progress.setObjectName("muted")
+        top.addWidget(self.back)
+        top.addStretch(1)
+        top.addWidget(self.progress)
+        lay.addLayout(top)
+        lay.addSpacing(22)
+
+        self.title = QLabel()
+        self.title.setObjectName("title")
+        self.title.setWordWrap(True)
+        self.problem = QLabel()
+        self.problem.setObjectName("muted")
+        self.problem.setWordWrap(True)
+        lay.addWidget(self.title)
+        lay.addSpacing(4)
+        lay.addWidget(self.problem)
+        lay.addSpacing(22)
+
+        # step 1
+        self.step1 = QLabel("1. Your new password is saved in the vault")
+        self.step1.setObjectName("step")
+        self.saved_note = QLabel()
+        self.saved_note.setObjectName("muted")
+        self.saved_note.setWordWrap(True)
+        self.step1_box = QWidget()
+        row1 = QHBoxLayout(self.step1_box)
+        row1.setContentsMargins(0, 0, 0, 0)
+        self.secret = QLineEdit()
+        self.secret.setObjectName("secret")
+        self.secret.setReadOnly(True)
+        self.secret.setEchoMode(QLineEdit.EchoMode.Password)
+        self.secret.setAccessibleName("New password")
+        self.show_btn = QPushButton("Show")
+        self.show_btn.clicked.connect(self.toggle_show)
+        self.copy_btn = QPushButton("Copy")
+        self.copy_btn.clicked.connect(self.copy)
+        row1.addWidget(self.secret, 1)
+        row1.addWidget(self.show_btn)
+        row1.addWidget(self.copy_btn)
+        self.step1_all = QWidget()
+        s1 = QVBoxLayout(self.step1_all)
+        s1.setContentsMargins(0, 0, 0, 20)
+        s1.setSpacing(0)
+        s1.addWidget(self.step1)
+        s1.addSpacing(4)
+        s1.addWidget(self.saved_note)
+        s1.addSpacing(8)
+        s1.addWidget(self.step1_box)
+        lay.addWidget(self.step1_all)
+
+        # step 2
+        self.step2_box = QWidget()
+        s2 = QVBoxLayout(self.step2_box)
+        s2.setContentsMargins(0, 0, 0, 20)
+        s2.setSpacing(8)
+        step2 = QLabel("2. Change it on the site")
+        step2.setObjectName("step")
+        row2 = QHBoxLayout()
+        self.url_label = QLabel()
+        self.url_label.setObjectName("muted")
+        self.url_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.url_label.setWordWrap(True)
+        self.open_btn = QPushButton("Open change page")
+        self.open_btn.clicked.connect(self.open_page)
+        row2.addWidget(self.url_label, 1)
+        row2.addWidget(self.open_btn)
+        s2.addWidget(step2)
+        s2.addLayout(row2)
+        lay.addWidget(self.step2_box)
+
+        # step 3
+        self.step3 = QLabel("3. Log out, log back in with the new password, then tell vaultkit")
+        self.step3.setObjectName("step")
+        self.step3.setWordWrap(True)
+        row3 = QHBoxLayout()
+        self.accept_btn = QPushButton("The site accepted it")
+        self.accept_btn.setObjectName("primary")
+        self.accept_btn.clicked.connect(self.accepted)
+        self.reject_btn = QPushButton("The site rejected it")
+        self.reject_btn.clicked.connect(self.rejected)
+        self.skip_btn = QPushButton("Skip for now")
+        self.skip_btn.clicked.connect(self.skip)
+        for b in (self.accept_btn, self.reject_btn, self.skip_btn):
+            row3.addWidget(b)
+        row3.addStretch(1)
+        self.status = QLabel()
+        self.status.setWordWrap(True)
+        lay.addWidget(self.step3)
+        lay.addSpacing(6)
+        lay.addWidget(self.status)
+        lay.addSpacing(10)
+        lay.addLayout(row3)
+        lay.addSpacing(18)
+
+        # rules
+        self.rules_toggle = QPushButton("Password rules for this site")
+        self.rules_toggle.setObjectName("link")
+        self.rules_toggle.clicked.connect(lambda: self.show_rules(not self.rules.isVisible()))
+        lay.addWidget(self.rules_toggle)
+        self.rules = QWidget()
+        self.rules.setObjectName("rules")
+        self.rules.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        form = QFormLayout(self.rules)
+        form.setContentsMargins(16, 14, 16, 14)
+        form.setVerticalSpacing(10)
+        self.length = NumberField(8, 128)
+        self.length.setAccessibleName("Password length")
+        symrow = QHBoxLayout()
+        self.symbols = QLineEdit()
+        self.symbols.setAccessibleName("Allowed symbols")
+        self.no_symbols = QCheckBox("Letters and numbers only")
+        self.no_symbols.toggled.connect(lambda on: self.symbols.setEnabled(not on))
+        symrow.addWidget(self.symbols, 1)
+        symrow.addWidget(self.no_symbols)
+        self.change_url = QLineEdit()
+        self.change_url.setPlaceholderText("Leave blank to use the site's standard change page")
+        self.twofa = QComboBox()
+        for key, label in self.TWOFA:
+            self.twofa.addItem(label, key)
+        self.save_rules_btn = QPushButton("Save rules and make a new password")
+        self.save_rules_btn.clicked.connect(self.save_rules)
+        form.addRow("Length", self.length)
+        form.addRow("Allowed symbols", symrow)
+        form.addRow("Change page", self.change_url)
+        form.addRow("Two-step login", self.twofa)
+        form.addRow("", self.save_rules_btn)
+        lay.addSpacing(6)
+        lay.addWidget(self.rules)
+        lay.addStretch(1)
+        self.rules.hide()
+
+    # -- lifecycle
+    def start(self, vault: vk.Vault, issues: list[Issue], rows: dict[str, dict[str, str]]) -> None:
+        self.vault, self.queue, self.rows = vault, list(issues), rows
+        self.idx, self.changed = 0, 0
+        self.load_current()
+
+    def reset(self) -> None:
+        """Called on lock: forget everything secret this page holds."""
+        self.clip.clear()
+        self.secret.clear()
+        self.vault = None
+        self.queue = []
+
+    def finish(self) -> None:
+        self.clip.clear()
+        self.secret.clear()
+        self.finished.emit(self.changed)
+
+    @property
+    def entry(self) -> str:
+        return self.queue[self.idx].name
+
+    def set_busy(self, busy: bool, text: str = "") -> None:
+        for w in (self.accept_btn, self.reject_btn, self.skip_btn, self.copy_btn,
+                  self.show_btn, self.open_btn, self.save_rules_btn):
+            w.setEnabled(not busy)
+        if busy:
+            self.say(text)
+
+    def say(self, text: str, kind: str = "muted") -> None:
+        self.status.setObjectName(kind)
+        self.status.style().unpolish(self.status)
+        self.status.style().polish(self.status)
+        self.status.setText(text)
+        self.status.setVisible(bool(text))
+
+    def show_rules(self, on: bool) -> None:
+        self.rules.setVisible(on)
+        self.rules_toggle.setText("Hide password rules" if on else "Password rules for this site")
+
+    # -- per entry
+    def load_current(self) -> None:
+        if self.idx >= len(self.queue):
+            self.finish()
+            return
+        issue = self.queue[self.idx]
+        self.progress.setText(f"{self.idx + 1} of {len(self.queue)}")
+        self.title.setText(issue.name)
+        self.problem.setText(issue.problem)
+        self.secret.clear()
+        self.secret.setEchoMode(QLineEdit.EchoMode.Password)
+        self.show_btn.setText("Show")
+        self.show_rules(False)
+        self.set_actions(rejected=False)
+        v, entry, row = self.vault, issue.name, self.rows.get(issue.name)
+
+        def work():
+            info = vk.site_info(v, entry, row)
+            pend = vk.pending_path(entry)
+            resumed = v.exists(pend)
+            if not resumed:
+                vk.start_rotation(v, entry, info)
+            return info, v.attr(pend, "Password"), resumed
+
+        self.set_busy(True, "Making a new password and saving it in your vault…")
+        self.runner.submit(work, self._loaded, self._failed)
+
+    def _loaded(self, result) -> None:
+        info, pw, resumed = result
+        if self.vault is None:
+            return
+        self.set_busy(False)
+        self.secret.setText(pw)
+        prof = info.profile
+        self.saved_note.setText(
+            "This is the one saved last time. It's still waiting to be used."
+            if resumed else
+            "It's stored next to the old one, so nothing is lost if the site change fails.")
+        self.url = vk.change_url_for(prof, info.url)
+        self.url_label.setText(self.url or "This entry has no web address. Open the site and "
+                               "find its password settings.")
+        self.open_btn.setEnabled(bool(self.url))
+        self.fill_rules(prof)
+        twofa = dict(self.TWOFA).get(prof.twofa, prof.twofa)
+        self.say(f"Have your {twofa.lower()} ready: the site may ask for it."
+                 if prof.twofa != "none" else "")
+        self.copy()
+        self.accept_btn.setFocus()
+
+    def _failed(self, msg: str) -> None:
+        self.set_busy(False)
+        self.say(msg, "error")
+
+    def fill_rules(self, prof: vk.Profile) -> None:
+        self.length.setValue(prof.length)
+        self.no_symbols.setChecked(not prof.symbols)
+        self.symbols.setText(prof.symbols or vk.DEFAULT_SYMBOLS)
+        self.change_url.setText(prof.change_url)
+        self.twofa.setCurrentIndex(max(self.twofa.findData(prof.twofa), 0))
+
+    def set_actions(self, rejected: bool) -> None:
+        self.step1_all.setVisible(not rejected)
+        self.step2_box.setVisible(not rejected)
+        self.accept_btn.setVisible(not rejected)
+        self.reject_btn.setVisible(not rejected)
+        self.rules_toggle.setVisible(not rejected)
+        self.step3.setText("Make a password this site will accept" if rejected else
+                           "3. Log out, log back in with the new password, then tell vaultkit")
+        self.save_rules_btn.setObjectName("primary" if rejected else "")
+        self.save_rules_btn.style().unpolish(self.save_rules_btn)
+        self.save_rules_btn.style().polish(self.save_rules_btn)
+
+    # -- actions
+    def toggle_show(self) -> None:
+        hidden = self.secret.echoMode() == QLineEdit.EchoMode.Password
+        self.secret.setEchoMode(QLineEdit.EchoMode.Normal if hidden
+                                else QLineEdit.EchoMode.Password)
+        self.show_btn.setText("Hide" if hidden else "Show")
+
+    def copy(self) -> None:
+        if self.secret.text():
+            self.clip.copy(self.secret.text())
+            self.copy_btn.setText("Copied")
+            QTimer.singleShot(2000, lambda: self.copy_btn.setText("Copy"))
+
+    def open_page(self) -> None:
+        if self.url:
+            open_link(self.url)
+
+    def accepted(self) -> None:
+        v, entry = self.vault, self.entry
+        self.set_busy(True, "Saving…")
+        self.runner.submit(lambda: vk.commit_rotation(v, entry), self._committed, self._failed)
+
+    def _committed(self, _r) -> None:
+        self.changed += 1
+        self.clip.clear()
+        self.idx += 1
+        self.load_current()
+
+    def rejected(self) -> None:
+        v, entry = self.vault, self.entry
+        self.set_busy(True, "Discarding the new password…")
+        self.runner.submit(lambda: vk.abort_rotation(v, entry), self._discarded, self._failed)
+
+    def _discarded(self, _r) -> None:
+        self.set_busy(False)
+        self.clip.clear()
+        self.secret.clear()
+        self.set_actions(rejected=True)
+        self.show_rules(True)
+        self.say("The new password was discarded and your old one is unchanged. Sites often "
+                 "limit length or symbols: check what this site allows, set it below, then "
+                 "make a new password. Or skip this site for now.")
+        self.length.setFocus()
+
+    def skip(self) -> None:
+        self.clip.clear()
+        self.idx += 1
+        self.load_current()
+
+    def save_rules(self) -> None:
+        prof = vk.Profile(length=self.length.value(),
+                          symbols="" if self.no_symbols.isChecked() else self.symbols.text().strip(),
+                          change_url=self.change_url.text().strip(),
+                          twofa=self.twofa.currentData())
+        try:
+            vk.generate_password(prof.length, prof.symbols)
+        except ValueError as e:
+            self.say(f"Those rules don't work: {e}.", "error")
+            return
+        v, entry = self.vault, self.entry
+
+        def work():
+            notes = vk.upsert_profile(v.attr(entry, "Notes"), prof)
+            v.set_notes(entry, notes)
+            pend = vk.pending_path(entry)
+            if v.exists(pend):
+                vk.abort_rotation(v, entry)
+            info = vk.SiteInfo(v.attr(entry, "UserName"), v.attr(entry, "URL"), notes)
+            vk.start_rotation(v, entry, info)
+            return info, v.attr(pend, "Password"), False
+
+        self.set_busy(True, "Saving the rules and making a new password…")
+        self.runner.submit(work, self._regenerated, self._failed)
+
+    def _regenerated(self, result) -> None:
+        self._loaded(result)
+        self.set_actions(rejected=False)
+        self.say("Rules saved. A new password that follows them is ready and copied.", "ok")
+
+# ---------------------------------------------------------------------------- window
+class Banner(QWidget):
+    """One-line notice above every page: update ready, just updated, or update rejected."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setObjectName("banner")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(28, 10, 28, 10)
+        self.text = QLabel()
+        self.text.setWordWrap(True)
+        self.text.setTextFormat(Qt.TextFormat.PlainText)  # release notes are never HTML
+        self.action = QPushButton()
+        self.action.setObjectName("primary")
+        self.dismiss = QPushButton("Dismiss")
+        self.dismiss.setObjectName("link")
+        self.dismiss.clicked.connect(self.hide)
+        lay.addWidget(self.text, 1)
+        lay.addWidget(self.action)
+        lay.addWidget(self.dismiss)
+        self.hide()
+
+    def show_message(self, text: str, action: str = "", warn: bool = False) -> None:
+        self.setProperty("warn", "true" if warn else "false")
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.text.setText(text)
+        self.action.setText(action)
+        self.action.setVisible(bool(action))
+        self.show()
+
+
+class IdleWatcher(QObject):
+    """Restart the lock timer on any keyboard or mouse activity in the app."""
+    EVENTS = {QEvent.Type.KeyPress, QEvent.Type.MouseButtonPress, QEvent.Type.MouseMove,
+              QEvent.Type.Wheel}
+
+    def __init__(self, timer: QTimer) -> None:
+        super().__init__()
+        self.timer = timer
+
+    def eventFilter(self, obj, event) -> bool:
+        if event.type() in self.EVENTS and self.timer.isActive():
+            self.timer.start()
+        return False
+
+
+class MainWindow(QMainWindow):
+    def __init__(self, idle_minutes: float = IDLE_LOCK_MINUTES, startup_note: str = "",
+                 check_updates: bool = True) -> None:
+        super().__init__()
+        self.setWindowTitle("vaultkit")
+        self.setMinimumSize(720, 560)
+        self.settings = QSettings("vaultkit", "vaultkit")
+        self.runner = Runner()
+
+        self.stack = QStackedWidget()
+        self.unlock = UnlockPage(self.runner, self.settings)
+        self.dash = DashboardPage(self.runner)
+        self.clip = SecretClipboard()
+        self.fix = FixPage(self.runner, self.clip)
+        self.stack.addWidget(self.unlock)
+        self.stack.addWidget(self.dash)
+        self.stack.addWidget(self.fix)
+        self.banner = Banner()
+        self.banner.action.clicked.connect(self.restart)
+        central = QWidget()
+        col = QVBoxLayout(central)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(0)
+        col.addWidget(self.banner)
+        col.addWidget(self.stack, 1)
+        self.setCentralWidget(central)
+
+        # updates: their own worker thread so a slow download never delays a vault check
+        self.net = Runner()
+        self.update_timer = QTimer(self)
+        self.update_timer.setInterval(UPDATE_CHECK_HOURS * 3600 * 1000)
+        self.update_timer.timeout.connect(self.check_updates)
+        if startup_note:
+            warn = not startup_note.startswith("Updated")
+            self.banner.show_message(startup_note, warn=warn)
+        if check_updates:
+            QTimer.singleShot(3000, self.check_updates)
+            self.update_timer.start()
+
+        self.idle = QTimer(self)
+        self.idle.setSingleShot(True)
+        self.idle.setInterval(int(idle_minutes * 60_000))
+        self.idle.timeout.connect(lambda: self.lock(
+            f"Locked after {idle_minutes:g} minutes without activity."))
+        self.watcher = IdleWatcher(self.idle)
+        QApplication.instance().installEventFilter(self.watcher)
+
+        self.unlock.unlocked.connect(self.on_unlocked)
+        self.dash.lock_requested.connect(lambda: self.lock())
+        self.dash.fix_requested.connect(self.on_fix)
+        self.fix.finished.connect(self.on_fixed)
+
+    # -- updates
+    def check_updates(self) -> None:
+        current = vk.__version__
+        self.net.submit(lambda: updater.check_for_update(current),
+                        self._update_staged, self._update_failed)
+
+    def _update_staged(self, staged) -> None:
+        if staged is None:
+            return
+        notes = f" What's new: {staged.notes}" if staged.notes else ""
+        self.banner.show_message(f"vaultkit {staged.version} is downloaded and verified. "
+                                 f"It installs when the app restarts.{notes}", "Restart now")
+
+    def _update_failed(self, msg: str) -> None:
+        updater.log(f"check failed: {msg}")
+        if "signature" in msg or "unsafe" in msg or "doesn't match" in msg:
+            self.banner.show_message(
+                f"An update was rejected because it failed verification ({msg}). Nothing "
+                "was installed. If you didn't publish a release just now, check your GitHub "
+                "account.", warn=True)
+        # offline / GitHub unreachable: stay quiet and try again tomorrow
+
+    def restart(self) -> None:
+        self.lock()
+        launcher = HERE / "launcher.py"
+        subprocess.Popen([sys.executable, str(launcher)], cwd=str(HERE), close_fds=True)
+        QApplication.instance().quit()
+
+    def on_fix(self, issues: list) -> None:
+        if not self.dash.vault or not self.dash.report:
+            return
+        self.stack.setCurrentWidget(self.fix)
+        self.fix.start(self.dash.vault, issues, self.dash.report.rows)
+
+    def on_fixed(self, changed: int) -> None:
+        self.stack.setCurrentWidget(self.dash)
+        self.dash.start_check()  # show the vault as it is now
+
+    def on_unlocked(self, v: vk.Vault) -> None:
+        self.stack.setCurrentWidget(self.dash)
+        self.idle.start()
+        self.dash.open(v)
+
+    def lock(self, message: str = "") -> None:
+        self.idle.stop()
+        self.fix.reset()
+        self.dash.close_vault()
+        self.stack.setCurrentWidget(self.unlock)
+        self.unlock.refresh(message)
+
+    def closeEvent(self, event) -> None:
+        self.fix.reset()
+        self.dash.close_vault()
+        self.runner.wait()
+        self.net.wait()
+        super().closeEvent(event)
+
+
+def apply_theme(app: QApplication) -> None:
+    app.setStyle("Fusion")  # consistent look; our palette, not the OS dark/light guess
+    pal = QPalette()
+    pal.setColor(QPalette.ColorRole.Window, QColor(PAPER))
+    pal.setColor(QPalette.ColorRole.WindowText, QColor(INK))
+    pal.setColor(QPalette.ColorRole.Base, QColor(SURFACE))
+    pal.setColor(QPalette.ColorRole.AlternateBase, QColor(PAPER))
+    pal.setColor(QPalette.ColorRole.Text, QColor(INK))
+    pal.setColor(QPalette.ColorRole.Button, QColor(SURFACE))
+    pal.setColor(QPalette.ColorRole.ButtonText, QColor(INK))
+    pal.setColor(QPalette.ColorRole.Highlight, QColor("#DCE6F0"))
+    pal.setColor(QPalette.ColorRole.HighlightedText, QColor(INK))
+    pal.setColor(QPalette.ColorRole.ToolTipBase, QColor(SURFACE))
+    pal.setColor(QPalette.ColorRole.ToolTipText, QColor(INK))
+    pal.setColor(QPalette.ColorRole.PlaceholderText, QColor(MUTED))
+    app.setPalette(pal)
+    app.setStyleSheet(STYLE)
+
+
+def main(startup_note: str = "") -> int:
+    app = QApplication(sys.argv)
+    app.setApplicationName("vaultkit")
+    app.setOrganizationName("vaultkit")
+    apply_theme(app)
+    w = MainWindow(startup_note=startup_note)
+    w.resize(860, 640)
+    w.show()
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
