@@ -22,8 +22,8 @@ from pathlib import Path
 from typing import Callable
 
 from PySide6.QtCore import (QBuffer, QByteArray, QEvent, QIODevice, QMimeData, QObject,
-                            QRectF, QRunnable, QSettings, QSize, Qt, QThreadPool, QTimer, QUrl,
-                            Signal)
+                            QProcess, QRectF, QRunnable, QSettings, QSize, Qt, QThreadPool, QTimer,
+                            QUrl, Signal)
 from PySide6.QtGui import (QAction, QActionGroup, QColor, QDesktopServices, QIcon, QIntValidator,
                            QPainter, QPainterPath,
                            QPalette, QPixmap)
@@ -38,8 +38,10 @@ from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import autostart  # noqa: E402
+import kpsetup  # noqa: E402
 import secretstore  # noqa: E402
 import shortcuts  # noqa: E402
+import strength  # noqa: E402
 import updater  # noqa: E402
 import vaultkit as vk  # noqa: E402
 
@@ -161,6 +163,9 @@ QCheckBox::indicator:checked {{ background: {t.focus}; border-color: {t.focus}; 
 QCheckBox::indicator:focus {{ border: 2px solid {t.focus}; }}
 QCheckBox::indicator:disabled {{ border-color: {t.line}; background: {t.paper}; }}
 QLabel#step {{ font-weight: 600; }}
+QLabel#rowtitle {{ font-weight: 600; }}
+QWidget#notice {{ background: {t.warn_bg}; border: 1px solid {t.line}; border-radius: 6px; }}
+QWidget#guide {{ background: {t.surface}; border: 1px solid {t.line}; border-radius: 6px; }}
 QWidget#banner {{ background: {t.selection}; border-bottom: 1px solid {t.line}; }}
 QWidget#banner[warn="true"] {{ background: {t.warn_bg}; }}
 QLabel#ok {{ color: {t.safe}; }}
@@ -399,9 +404,11 @@ def friendly_error(e: Exception) -> str:
         if "no saved master password" in low:
             return "There's no saved password on this PC. Unlock with your master password."
         return f"KeePassXC reported a problem: {msg}"
+    if isinstance(e, kpsetup.SetupError):
+        return msg
     if isinstance(e, FileNotFoundError):
-        return ("Can't find keepassxc-cli. Install KeePassXC, then make sure "
-                "C:\\Program Files\\KeePassXC is on your PATH.")
+        return ("KeePassXC isn't installed, or vaultkit can't find it. Press Setup (bottom of "
+                "the window) to install it.")
     if isinstance(e, urllib.error.URLError):
         return ("Couldn't reach the breach database (api.pwnedpasswords.com). "
                 "Check your internet connection, then press Check now.")
@@ -757,6 +764,8 @@ class LegendItem(QWidget):
 # ---------------------------------------------------------------------------- pages
 class UnlockPage(QWidget):
     unlocked = Signal(object)  # vk.Vault
+    setup_requested = Signal()
+    create_requested = Signal()
 
     def __init__(self, runner: Runner, settings: QSettings) -> None:
         super().__init__()
@@ -780,6 +789,22 @@ class UnlockPage(QWidget):
         lay.addWidget(self.note)
         lay.addSpacing(8)
 
+        self.kp_notice = QWidget()
+        self.kp_notice.setObjectName("notice")
+        self.kp_notice.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        kn = QHBoxLayout(self.kp_notice)
+        kn.setContentsMargins(14, 10, 14, 10)
+        kn_text = QLabel("KeePassXC isn't installed yet. vaultkit needs it: it's where your "
+                         "passwords are kept.")
+        kn_text.setWordWrap(True)
+        self.kp_button = QPushButton("Set up KeePassXC")
+        self.kp_button.setObjectName("primary")
+        self.kp_button.clicked.connect(self.setup_requested.emit)
+        kn.addWidget(kn_text, 1)
+        kn.addWidget(self.kp_button)
+        self.kp_notice.hide()
+        lay.addWidget(self.kp_notice)
+
         lay.addWidget(QLabel("Vault file"))
         row = QHBoxLayout()
         self.db = QLineEdit(settings.value("db", os.environ.get("VAULTKIT_DB", "")))
@@ -789,6 +814,10 @@ class UnlockPage(QWidget):
         row.addWidget(self.db, 1)
         row.addWidget(browse)
         lay.addLayout(row)
+        self.create_link = QPushButton("No vault yet? Create one")
+        self.create_link.setObjectName("link")
+        self.create_link.clicked.connect(self.create_requested.emit)
+        lay.addWidget(self.create_link)
 
         lay.addWidget(QLabel("Master password"))
         self.pw = QLineEdit()
@@ -851,6 +880,7 @@ class UnlockPage(QWidget):
         self.refresh()
 
     def refresh(self, message: str = "") -> None:
+        self.kp_notice.setVisible(kpsetup.find_cli() is None)
         self.saved.setVisible(secretstore.supported() and secretstore.is_saved())
         self.remember.setChecked(False)
         self.set_busy(False)
@@ -1521,6 +1551,464 @@ class FixPage(QWidget):
         self.set_actions(rejected=False)
         self.say("Rules saved. A new password that follows them is ready and copied.", "ok")
 
+# ---------------------------------------------------------------------------- setup
+class Progress(QObject):
+    """Progress lines from a worker thread, delivered on the UI thread (queued signal)."""
+    message = Signal(str)
+
+
+class SetupRow(QWidget):
+    """One check: status dot, title, plain-words detail, and its fix button."""
+
+    def __init__(self, check: kpsetup.Check) -> None:
+        super().__init__()
+        self.check = check
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 8, 0, 8)
+        lay.setSpacing(12)
+        self.dot = QLabel()
+        self.dot.setFixedWidth(12)
+        lay.addWidget(self.dot, 0, Qt.AlignmentFlag.AlignTop)
+        words = QVBoxLayout()
+        words.setSpacing(2)
+        title = QLabel(check.title)
+        title.setObjectName("rowtitle")
+        self.detail = QLabel(check.detail)
+        self.detail.setObjectName("muted")
+        self.detail.setWordWrap(True)
+        words.addWidget(title)
+        words.addWidget(self.detail)
+        lay.addLayout(words, 1)
+        self.button = QPushButton(check.action)
+        self.button.setVisible(bool(check.action))
+        if check.ok is False:
+            self.button.setObjectName("primary")
+        lay.addWidget(self.button, 0, Qt.AlignmentFlag.AlignTop)
+        state = {True: "done", False: "needs attention", None: "information"}[check.ok]
+        self.setAccessibleName(f"{check.title}: {state}. {check.detail}")
+        self.repaint_dot()
+
+    def repaint_dot(self) -> None:
+        color = {True: T.safe, False: T.risk, None: T.muted}[self.check.ok]
+        self.dot.setPixmap(swatch(color).pixmap(10, 10))
+
+
+class SetupPage(QWidget):
+    """KeePassXC installed and set up the recommended way, plus vaultkit's own options."""
+    back_requested = Signal()
+    create_requested = Signal()
+    autostart_requested = Signal()
+
+    def __init__(self, runner: Runner, settings: QSettings) -> None:
+        super().__init__()
+        self.setObjectName("page")
+        self.runner, self.settings = runner, settings
+        self.checks: list[kpsetup.Check] = []
+        self.rows: list[SetupRow] = []
+        self.busy = False
+        self.progress = Progress()
+        self.progress.message.connect(self.say)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(28, 20, 28, 20)
+        outer.setSpacing(0)
+        top = QHBoxLayout()
+        back = QPushButton("Back")
+        back.setObjectName("link")
+        back.clicked.connect(self.back_requested.emit)
+        top.addWidget(back)
+        top.addStretch(1)
+        self.recheck = QPushButton("Check again")
+        self.recheck.clicked.connect(self.refresh)
+        top.addWidget(self.recheck)
+        outer.addLayout(top)
+        outer.addSpacing(16)
+        title = QLabel("Setup")
+        title.setObjectName("title")
+        sub = QLabel("KeePassXC installed and set up the way vaultkit recommends. Nothing here "
+                     "reads your passwords.")
+        sub.setObjectName("muted")
+        sub.setWordWrap(True)
+        outer.addWidget(title)
+        outer.addSpacing(4)
+        outer.addWidget(sub)
+        outer.addSpacing(10)
+        self.status = QLabel()
+        self.status.setObjectName("muted")
+        self.status.setWordWrap(True)
+        self.status.hide()
+        outer.addWidget(self.status)
+        outer.addSpacing(6)
+
+        self.body = QWidget()
+        self.body.setObjectName("scrollbody")
+        self.list = QVBoxLayout(self.body)
+        self.list.setContentsMargins(0, 0, 8, 0)
+        self.list.setSpacing(0)
+        self.list.addStretch(1)
+        scroll = QScrollArea()
+        scroll.setObjectName("scroll")
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(self.body)
+        outer.addWidget(scroll, 1)
+
+        # finishing the vault's encryption settings in KeePassXC (keepassxc-cli can't)
+        self.guide = QWidget()
+        self.guide.setObjectName("guide")
+        g = QVBoxLayout(self.guide)
+        g.setContentsMargins(16, 12, 16, 12)
+        g.setSpacing(6)
+        gt = QLabel("Make your vault much harder to crack (one time, about a minute)")
+        gt.setObjectName("rowtitle")
+        gt.setWordWrap(True)
+        g.addWidget(gt)
+        self.guide_steps = QLabel()
+        self.guide_steps.setWordWrap(True)
+        self.guide_steps.setTextFormat(Qt.TextFormat.PlainText)
+        g.addWidget(self.guide_steps)
+        gb = QHBoxLayout()
+        self.open_kp = QPushButton("Open vault in KeePassXC")
+        self.open_kp.clicked.connect(self.open_in_keepassxc)
+        gb.addWidget(self.open_kp)
+        gb.addStretch(1)
+        g.addLayout(gb)
+        self.guide.hide()
+        self.list.insertWidget(0, self.guide)
+        self.guide_wanted = False
+
+    # -- checks
+    def db(self) -> str:
+        return (self.settings.value("db", "") or "").strip().strip('"')
+
+    def refresh(self) -> None:
+        if self.busy:
+            return
+        self.recheck.setEnabled(False)
+        db = self.db()
+        self.runner.submit(lambda: self._collect(db), self.show_checks, self._failed)
+
+    @staticmethod
+    def _collect(db: str) -> list[kpsetup.Check]:
+        checks = kpsetup.run_checks(db or None)
+        if autostart.supported():
+            on = autostart.is_enabled()
+            checks.append(kpsetup.Check(
+                "vk_autostart", "vaultkit starts with Windows", on,
+                "So the daily check runs without you opening anything." if on else
+                "The daily check only runs while vaultkit is open.", "" if on else "Turn on"))
+        if secretstore.supported():
+            saved = secretstore.is_saved()
+            checks.append(kpsetup.Check(
+                "remember", "Daily checks without unlocking", True if saved else None,
+                "Your master password is saved for this, encrypted to your Windows login."
+                if saved else "Optional: tick 'Remember on this PC' when you next unlock."))
+        return checks
+
+    def show_checks(self, checks: list[kpsetup.Check]) -> None:
+        self.recheck.setEnabled(not self.busy)
+        self.checks = checks
+        for row in self.rows:
+            self.list.removeWidget(row)
+            row.deleteLater()
+        self.rows = []
+        self.list.removeWidget(self.guide)
+        for ch in checks:
+            row = SetupRow(ch)
+            row.button.clicked.connect(lambda _=False, c=ch: self.act(c))
+            row.button.setEnabled(not self.busy)
+            self.list.insertWidget(self.list.count() - 1, row)  # before the stretch
+            self.rows.append(row)
+            if ch.key == "vault":
+                self.list.insertWidget(self.list.count() - 1, self.guide)
+        vault = self.check("vault")
+        needs_guide = vault is not None and vault.action == "Show me how"
+        self.guide_steps.setText("\n".join(f"{n}. {t}" for n, t in
+                                           enumerate(kpsetup.strengthen_steps(), 1)))
+        self.guide.setVisible(needs_guide and self.guide_wanted)
+
+    def _failed(self, msg: str) -> None:
+        self.recheck.setEnabled(not self.busy)
+        self.say(msg, error=True)
+
+    def check(self, key: str) -> kpsetup.Check | None:
+        return next((c for c in self.checks if c.key == key), None)
+
+    def row(self, key: str) -> SetupRow | None:
+        return next((r for r in self.rows if r.check.key == key), None)
+
+    def repaint(self) -> None:
+        for row in self.rows:
+            row.repaint_dot()
+
+    # -- fixes
+    def say(self, text: str, error: bool = False) -> None:
+        self.status.setObjectName("error" if error else "muted")
+        self.status.style().unpolish(self.status)
+        self.status.style().polish(self.status)
+        self.status.setText(text)
+        self.status.setVisible(bool(text))
+
+    def act(self, ch: kpsetup.Check) -> None:
+        if ch.key == "vault":
+            if ch.action == "Create a vault":
+                self.create_requested.emit()
+            else:
+                self.guide_wanted = not self.guide.isVisible()
+                self.guide.setVisible(self.guide_wanted)
+            return
+        if ch.key == "extension":
+            open_link(kpsetup.EXTENSION_URL)
+            return
+        if ch.key == "vk_autostart":
+            self.autostart_requested.emit()
+            self.refresh()
+            return
+        jobs = {
+            "keepassxc": (self._install, "Getting KeePassXC…"),
+            "settings": (kpsetup.apply_settings, "Changing KeePassXC's settings…"),
+            "connector": (lambda: self._need_cli(kpsetup.register_connector),
+                          "Connecting browsers…"),
+            "autostart": (lambda: self._need_cli(kpsetup.enable_keepassxc_autostart),
+                          "Turning it on…"),
+        }
+        if ch.key in jobs:
+            self.run_fix(*jobs[ch.key])
+
+    @staticmethod
+    def _need_cli(fn: Callable[[Path], object]) -> object:
+        cli = kpsetup.find_cli()
+        if cli is None:
+            raise kpsetup.SetupError("Install KeePassXC first.")
+        return fn(cli)
+
+    def _install(self) -> None:
+        """Install, then the recommended setup straight away (as install.ps1 does)."""
+        cli = kpsetup.install_keepassxc(progress=self.progress.message.emit)
+        if not kpsetup.keepassxc_running():
+            kpsetup.apply_settings()
+        if kpsetup.supported():
+            if kpsetup.connector_problem():
+                kpsetup.register_connector(cli)
+            if not kpsetup.keepassxc_autostarts():
+                kpsetup.enable_keepassxc_autostart(cli)
+
+    def run_fix(self, work: Callable[[], object], text: str) -> None:
+        self.busy = True
+        for row in self.rows:
+            row.button.setEnabled(False)
+        self.recheck.setEnabled(False)
+        self.say(text)
+
+        def done(_r) -> None:
+            self.busy = False
+            self.say("Done.")
+            self.refresh()
+
+        def failed(msg: str) -> None:
+            self.busy = False
+            self.say(msg, error=True)
+            self.refresh()
+
+        self.runner.submit(work, done, failed)
+
+    def open_in_keepassxc(self) -> None:
+        cli = kpsetup.find_cli()
+        if cli is None:
+            self.say("Install KeePassXC first.", error=True)
+            return
+        args = [self.db()] if self.db() else []
+        if not QProcess.startDetached(str(kpsetup.gui_exe(cli)), args):
+            self.say("Couldn't open KeePassXC. Open it from the Start menu instead.", error=True)
+
+    def show_vault_guide(self) -> None:
+        """After creating a vault: the one step left, right in front of the person."""
+        self.guide_wanted = True
+        self.say("Your vault is created. One more step makes it much harder to crack:")
+
+
+class CreateVaultPage(QWidget):
+    """A new, empty vault: master password checked first, made by keepassxc-cli."""
+    created = Signal(str)       # path
+    back_requested = Signal()
+    MIN_LENGTH = 12
+
+    def __init__(self, runner: Runner, settings: QSettings) -> None:
+        super().__init__()
+        self.setObjectName("page")
+        self.runner, self.settings = runner, settings
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(28, 20, 28, 20)
+        top = QHBoxLayout()
+        back = QPushButton("Back")
+        back.setObjectName("link")
+        back.clicked.connect(self.back_requested.emit)
+        top.addWidget(back)
+        top.addStretch(1)
+        outer.addLayout(top)
+        outer.addStretch(1)
+        col = QWidget()
+        col.setMaximumWidth(460)
+        lay = QVBoxLayout(col)
+        lay.setSpacing(10)
+        title = QLabel("Create your vault")
+        title.setObjectName("title")
+        note = QLabel("A new, empty KeePassXC vault, kept only on this PC. Fill it by importing "
+                      "your browser's passwords, or let KeePassXC save logins as you go.")
+        note.setObjectName("muted")
+        note.setWordWrap(True)
+        lay.addWidget(title)
+        lay.addWidget(note)
+        lay.addSpacing(6)
+        lay.addWidget(QLabel("Where to keep it"))
+        row = QHBoxLayout()
+        self.path = QLineEdit(str(default_vault_path()))
+        browse = QPushButton("Browse…")
+        browse.clicked.connect(self.browse)
+        row.addWidget(self.path, 1)
+        row.addWidget(browse)
+        lay.addLayout(row)
+        lay.addWidget(QLabel("Master password"))
+        self.pw = QLineEdit()
+        self.pw.setEchoMode(QLineEdit.EchoMode.Password)
+        self.pw.setAccessibleName("New master password")
+        self.pw.textChanged.connect(self.update_hint)
+        lay.addWidget(self.pw)
+        lay.addWidget(QLabel("Type it again"))
+        self.pw2 = QLineEdit()
+        self.pw2.setEchoMode(QLineEdit.EchoMode.Password)
+        self.pw2.setAccessibleName("Repeat the master password")
+        self.pw2.returnPressed.connect(self.create)
+        lay.addWidget(self.pw2)
+        self.hint = QLabel()
+        self.hint.setObjectName("muted")
+        self.hint.setWordWrap(True)
+        lay.addWidget(self.hint)
+        self.paper = QCheckBox("I've written it on paper and put that somewhere safe")
+        lay.addWidget(self.paper)
+        paper_note = QLabel("If the master password is forgotten, nobody can get the passwords "
+                            "back, including vaultkit and KeePassXC.")
+        paper_note.setObjectName("muted")
+        paper_note.setWordWrap(True)
+        lay.addWidget(paper_note)
+        self.error = QLabel()
+        self.error.setObjectName("error")
+        self.error.setWordWrap(True)
+        self.error.hide()
+        lay.addWidget(self.error)
+        self.go = QPushButton("Create vault")
+        self.go.setObjectName("primary")
+        self.go.clicked.connect(self.create)
+        b = QHBoxLayout()
+        b.addWidget(self.go)
+        b.addStretch(1)
+        lay.addSpacing(4)
+        lay.addLayout(b)
+        h = QHBoxLayout()
+        h.addStretch(1)
+        h.addWidget(col, 3)
+        h.addStretch(1)
+        outer.addLayout(h)
+        outer.addStretch(2)
+        self.update_hint()
+
+    def reset(self, focus: bool = True) -> None:
+        self.pw.clear()
+        self.pw2.clear()
+        self.paper.setChecked(False)
+        self.error.hide()
+        self.go.setEnabled(True)
+        self.go.setText("Create vault")
+        if not self.path.text().strip() or Path(self.path.text().strip()).exists():
+            self.path.setText(str(default_vault_path()))
+        if focus:
+            QTimer.singleShot(0, self.pw.setFocus)
+
+    def browse(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(self, "Where to keep your vault", self.path.text(),
+                                              "KeePass databases (*.kdbx)")
+        if path:
+            self.path.setText(os.path.normpath(path))
+
+    @classmethod
+    def problem(cls, pw: str) -> str | None:
+        if len(pw) < cls.MIN_LENGTH:
+            return f"At least {cls.MIN_LENGTH} characters. Four or more random words work well."
+        return strength.weakness(pw)
+
+    def update_hint(self) -> None:
+        pw = self.pw.text()
+        if not pw:
+            text = ("Use four or more random words, like 'maple river lantern orbit'. It's the "
+                    "only password you'll need to remember.")
+        else:
+            text = self.problem(pw) or "Looks strong."
+        self.hint.setText(text)
+
+    def show_error(self, msg: str) -> None:
+        self.error.setText(msg)
+        self.error.show()
+
+    def create(self) -> None:
+        path = self.path.text().strip().strip('"')
+        pw, pw2 = self.pw.text(), self.pw2.text()
+        if not path:
+            return self.show_error("Choose where to keep the vault.")
+        if not path.lower().endswith(".kdbx"):
+            path += ".kdbx"
+        if Path(path).exists():
+            return self.show_error("A file with that name already exists. Choose another name.")
+        why = self.problem(pw)
+        if why:
+            return self.show_error(why)
+        if pw != pw2:
+            return self.show_error("The two passwords don't match.")
+        if not self.paper.isChecked():
+            return self.show_error("Write the master password down first, then tick the box.")
+        cli = kpsetup.find_cli()
+        if cli is None:
+            return self.show_error("Install KeePassXC first: Back, then Setup.")
+        self.pw.clear()
+        self.pw2.clear()
+        self.error.hide()
+        self.go.setEnabled(False)
+        self.go.setText("Creating…")
+
+        def work() -> str:
+            try:
+                breached = vk.pwned_counts({"master": pw})
+            except (OSError, urllib.error.URLError):
+                breached = {}  # offline: the length and pattern checks still applied
+            if breached:
+                raise kpsetup.SetupError("That password appears in known data breaches. "
+                                         "Choose a different one.")
+            kpsetup.create_vault(cli, path, pw)
+            return path
+
+        self.runner.submit(work, self._done, self._failed)
+
+    def _done(self, path: str) -> None:
+        self.settings.setValue("db", path)
+        self.go.setText("Create vault")
+        self.go.setEnabled(True)
+        self.created.emit(path)
+
+    def _failed(self, msg: str) -> None:
+        self.go.setText("Create vault")
+        self.go.setEnabled(True)
+        self.show_error(msg)
+        self.pw.setFocus()
+
+
+def default_vault_path() -> Path:
+    """<you>\\vaultkit\\vault\\main.kdbx in the one-folder layout, else Documents."""
+    folder = HERE.parent / "vault"
+    base = folder if folder.is_dir() else Path.home() / "Documents"
+    path, n = base / "main.kdbx", 2
+    while path.exists():
+        path, n = base / f"main-{n}.kdbx", n + 1
+    return path
+
+
 # ---------------------------------------------------------------------------- window
 class Banner(QWidget):
     """One-line notice above every page: update ready, just updated, or update rejected."""
@@ -1588,9 +2076,12 @@ class MainWindow(QMainWindow):
         self.dash = DashboardPage(self.runner)
         self.clip = SecretClipboard()
         self.fix = FixPage(self.runner, self.clip)
-        self.stack.addWidget(self.unlock)
-        self.stack.addWidget(self.dash)
-        self.stack.addWidget(self.fix)
+        self.net = Runner()  # downloads and setup: never queued behind a vault check
+        self.setup = SetupPage(self.net, self.settings)
+        self.create = CreateVaultPage(self.runner, self.settings)
+        self.setup_from: QWidget = self.unlock
+        for page in (self.unlock, self.dash, self.fix, self.setup, self.create):
+            self.stack.addWidget(page)
         self.banner = Banner()
         self.banner.action.clicked.connect(self.restart)
 
@@ -1606,9 +2097,16 @@ class MainWindow(QMainWindow):
         self.version_labels = [version_label(), version_label()]
         foot = QHBoxLayout()
         foot.setContentsMargins(28, 0, 28, 16)
+        self.setup_links = [QPushButton("Setup"), QPushButton("Setup")]
+        for b in self.setup_links:
+            b.setObjectName("link")
+            b.setAccessibleName("Setup: install and check KeePassXC")
+            b.clicked.connect(self.show_setup)
+        foot.addWidget(self.setup_links[0])
         foot.addStretch(1)
         foot.addWidget(self.version_labels[0])
         self.unlock.layout().addLayout(foot)
+        self.dash.top_bar.insertWidget(1, self.setup_links[1])
         self.dash.foot.addWidget(self.version_labels[1])
         hints = QApplication.styleHints()
         if hasattr(hints, "colorSchemeChanged"):
@@ -1621,8 +2119,7 @@ class MainWindow(QMainWindow):
         col.addWidget(self.stack, 1)
         self.setCentralWidget(central)
 
-        # updates: their own worker thread so a slow download never delays a vault check
-        self.net = Runner()
+        # updates use self.net too, so a slow download never delays a vault check
         self.update_timer = QTimer(self)
         self.update_timer.setInterval(UPDATE_CHECK_HOURS * 3600 * 1000)
         self.update_timer.timeout.connect(self.check_updates)
@@ -1655,6 +2152,13 @@ class MainWindow(QMainWindow):
         QApplication.instance().installEventFilter(self.watcher)
 
         self.unlock.unlocked.connect(self.on_unlocked)
+        self.unlock.setup_requested.connect(self.show_setup)
+        self.unlock.create_requested.connect(self.show_create)
+        self.setup.back_requested.connect(self.leave_setup)
+        self.setup.create_requested.connect(self.show_create)
+        self.setup.autostart_requested.connect(lambda: self.set_autostart(True))
+        self.create.back_requested.connect(self.leave_create)
+        self.create.created.connect(self.vault_created)
         self.dash.lock_requested.connect(lambda: self.lock())
         self.dash.fix_requested.connect(self.on_fix)
         self.fix.finished.connect(self.on_fixed)
@@ -1682,6 +2186,7 @@ class MainWindow(QMainWindow):
         if self.dash.report is not None:
             self.dash.show_report(self.dash.report)  # re-colour the issue swatches
         self.dash.bar.update()
+        self.setup.repaint()
 
     def _system_scheme_changed(self, *_args) -> None:
         if self.theme_key == "system":
@@ -1742,6 +2247,11 @@ class MainWindow(QMainWindow):
             autostart.enable(HERE / "launcher.py")
         else:
             autostart.disable()
+        act = getattr(self, "autostart_act", None)
+        if act is not None and act.isChecked() != on:
+            act.blockSignals(True)
+            act.setChecked(on)
+            act.blockSignals(False)
 
     def show_window(self) -> None:
         self.showNormal()
@@ -1919,6 +2429,41 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentWidget(self.dash)
         self.dash.start_check()  # show the vault as it is now
 
+    # -- setup and new vault
+    def show_setup(self) -> None:
+        if self.stack.currentWidget() not in (self.setup, self.create):
+            self.setup_from = self.stack.currentWidget()
+        self.stack.setCurrentWidget(self.setup)
+        self.setup.refresh()
+
+    def leave_setup(self) -> None:
+        if self.setup_from is self.unlock or self.dash.vault is None:
+            self.stack.setCurrentWidget(self.unlock)
+            self.unlock.refresh()
+        else:
+            self.stack.setCurrentWidget(self.setup_from)
+
+    def show_create(self) -> None:
+        self.create_from = self.stack.currentWidget()
+        self.create.reset()
+        self.stack.setCurrentWidget(self.create)
+
+    def leave_create(self) -> None:
+        self.create.reset(focus=False)
+        if getattr(self, "create_from", None) is self.setup:
+            self.stack.setCurrentWidget(self.setup)
+        else:
+            self.stack.setCurrentWidget(self.unlock)
+            self.unlock.refresh()
+
+    def vault_created(self, path: str) -> None:
+        self.create.reset(focus=False)
+        self.unlock.db.setText(path)
+        self.setup_from = self.unlock
+        self.setup.show_vault_guide()
+        self.stack.setCurrentWidget(self.setup)
+        self.setup.refresh()
+
     def on_unlocked(self, v: vk.Vault) -> None:
         self.stack.setCurrentWidget(self.dash)
         self.idle.start()
@@ -1927,6 +2472,7 @@ class MainWindow(QMainWindow):
     def lock(self, message: str = "") -> None:
         self.idle.stop()
         self.fix.reset()
+        self.create.reset(focus=False)  # never leave a half-typed master password on screen
         self.dash.close_vault()
         self.stack.setCurrentWidget(self.unlock)
         self.unlock.refresh(message)

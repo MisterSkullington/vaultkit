@@ -1,5 +1,6 @@
 # Runs every test on a real Windows machine on each push, including the Windows-only ones
-# (DPAPI, registry, PowerShell shortcuts, install.ps1 under Windows PowerShell 5.1).
+# (DPAPI, registry, PowerShell shortcuts, install.ps1 under Windows PowerShell 5.1), then a
+# real KeePassXC install.
 name: tests
 
 on:
@@ -31,6 +32,16 @@ jobs:
         shell: bash
         run: |
           python -m unittest discover -s tests -v 2>&1 | tee test-output.txt
+          exit ${PIPESTATUS[0]}
+      # The real thing: download KeePassXC, check its checksum and signature, install it
+      # silently, apply the recommended settings, create a vault and open it. Also checks
+      # the python.org installer install.ps1 would use is signed. Throwaway machine only.
+      - name: Real KeePassXC install
+        shell: bash
+        env:
+          VAULTKIT_REAL_KEEPASSXC: "1"
+        run: |
+          python -m unittest tests.test_windows.RealKeePassXC -v 2>&1 | tee -a test-output.txt
           exit ${PIPESTATUS[0]}
       # Each failing test becomes an annotation (title + traceback tail), readable through
       # the GitHub API without downloading the raw log.

@@ -29,7 +29,6 @@ import json
 import os
 import secrets
 import shlex
-import shutil
 import string
 import subprocess
 import sys
@@ -45,7 +44,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Iterable
 
-__version__ = "1.8.0"
+__version__ = "1.9.0"
 PENDING_GROUP = "vaultkit-pending"
 SKIP_GROUPS = {"Recycle Bin"}
 HIBP_RANGE_URL = "https://api.pwnedpasswords.com/range/{prefix}"
@@ -216,13 +215,20 @@ class CliError(RuntimeError):
     pass
 
 
+def default_cli() -> str:
+    """keepassxc-cli wherever KeePassXC is installed; PATH isn't required (kpsetup.find_cli)."""
+    import kpsetup
+    found = kpsetup.find_cli()
+    return str(found) if found else "keepassxc-cli"
+
+
 @dataclass
 class Vault:
     db: str
     key_file: str | None = None
     no_password: bool = False
     password_cmd: str | None = None
-    cli: str = field(default_factory=lambda: shutil.which("keepassxc-cli") or "keepassxc-cli")
+    cli: str = field(default_factory=lambda: default_cli())
     cli_prefix_args: list[str] = field(default_factory=list)  # e.g. [script] when cli is python
     use_saved_password: bool = False  # Windows DPAPI store (secretstore.py), opt-in
     _pw: str | None = field(default=None, repr=False)

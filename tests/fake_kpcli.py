@@ -6,6 +6,26 @@ from datetime import datetime, timedelta, timezone
 sys.stdout.reconfigure(encoding="utf-8")
 sys.stdin.reconfigure(encoding="utf-8")
 
+if sys.argv[1:] == ["--version"]:
+    print("2.7.12"); sys.exit(0)
+if sys.argv[1] == "db-create":  # like the real one: password twice on stdin, KDBX 3.1 + AES-KDF
+    path = sys.argv[-1]
+    pw = sys.stdin.read().split("\n")
+    if os.path.exists(path):
+        print(f"File {path} already exists.", file=sys.stderr); sys.exit(1)
+    if len(pw) < 2 or pw[0] != pw[1] or not pw[0]:
+        print("Failed to set database password.", file=sys.stderr); sys.exit(1)
+    import struct
+    aes_kdf, aes256 = (bytes.fromhex("c9d9f39a628a4460bf740d08c18a4fea"),
+                       bytes.fromhex("31c1f2e6bf714350be5805216afc5aff"))
+    head = struct.pack("<III", 0x9AA2D903, 0xB54BFB67, 0x00030001)
+    for fid, data in ((2, aes256), (6, struct.pack("<Q", 60000)), (0, b"\r\n\r\n")):
+        head += bytes([fid]) + struct.pack("<H", len(data)) + data
+    open(path, "wb").write(head + os.urandom(64))
+    if os.environ.get("FAKE_KP_STATE"):
+        json.dump({"master": pw[0], "groups": [], "entries": {}}, open(os.environ["FAKE_KP_STATE"], "w"))
+    sys.exit(0)
+
 state_path = os.environ["FAKE_KP_STATE"]
 st = json.load(open(state_path))
 lines = sys.stdin.read().split("\n")

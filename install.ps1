@@ -7,13 +7,18 @@
     powershell -ExecutionPolicy Bypass -File install.ps1 -PublicKey <that key>
 
   What it does:
-    1. Installs what's missing: 64-bit Python 3.13, KeePassXC, the PySide6 and cryptography packages.
-    2. Downloads the latest release and checks its signature against YOUR key before unpacking
-       anything. A release that doesn't match is never unpacked or run.
+    1. Installs 64-bit Python 3.13 if it's missing, straight from python.org (just for you, no
+       admin), after Windows confirms the installer is signed by the Python Software Foundation.
+       Then the PySide6 and cryptography packages.
+    2. Downloads the latest vaultkit release and checks its signature against YOUR key before
+       unpacking anything. A release that doesn't match is never unpacked or run.
     3. Unpacks to <you>\vaultkit\app, makes <you>\vaultkit\vault, pins your key for future updates.
-    4. Starts vaultkit. It adds its own Start-menu entry.
+    4. Installs KeePassXC if it's missing (kpsetup.py: official installer, checksum and
+       signature checked, one Windows prompt) and sets it up the recommended way.
+    5. Starts vaultkit. It adds its own Start-menu entry; its Setup page shows what's left.
 
-  Your vault is never downloaded: copy main.kdbx into vaultkit\vault yourself, or create a new one.
+  winget isn't needed. Your vault is never downloaded: copy main.kdbx into vaultkit\vault
+  yourself, or create a new one from vaultkit's unlock screen.
 #>
 [CmdletBinding()]
 param(
@@ -24,7 +29,8 @@ param(
     [string]$ReleaseSig = '',
     [string]$Python = '',          # interpreter to use; default: finds or installs 64-bit Python
     [switch]$SkipPrerequisites,    # don't install Python/KeePassXC/packages (testing)
-    [switch]$NoLaunch
+    [switch]$NoLaunch,
+    [switch]$CheckDownloadsOnly    # just download + verify the Python installer, install nothing
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2
@@ -46,36 +52,91 @@ function Refresh-Path {
     $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
 }
 function Find-Python {
-    if (-not (Get-Command py -ErrorAction SilentlyContinue)) { return $null }
-    foreach ($v in '-3.13', '-3.12', '-3.11', '-3.10') {
-        $out = & py $v -c "import struct,sys;print(struct.calcsize('P')*8);print(sys.executable)" 2>$null
-        if ($LASTEXITCODE -eq 0 -and $out -and $out[0] -eq '64') { return $out[1] }
+    $launchers = @()
+    $cmd = Get-Command py -ErrorAction SilentlyContinue
+    if ($cmd) { $launchers += $cmd.Source }
+    $userLauncher = Join-Path $env:LOCALAPPDATA 'Programs\Python\Launcher\py.exe'
+    if (Test-Path -LiteralPath $userLauncher) { $launchers += $userLauncher }
+    foreach ($py in $launchers) {
+        foreach ($v in '-3.13', '-3.12', '-3.11', '-3.10') {
+            $out = & $py $v -c "import struct,sys;print(struct.calcsize('P')*8);print(sys.executable)" 2>$null
+            if ($LASTEXITCODE -eq 0 -and $out -and $out[0] -eq '64') { return $out[1] }
+        }
+    }
+    foreach ($exe in (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python313\python.exe'),
+                     (Join-Path $env:ProgramFiles 'Python313\python.exe')) {
+        if (Test-Path -LiteralPath $exe) { return $exe }
     }
     return $null
 }
-function Winget-Install([string]$Id, [string]$Label) {
-    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
-        Fail "$Label is needed and winget isn't available. Install $Label yourself, then run this again."
+
+$PythonSigner = 'Python Software Foundation'
+function Get-Signer([string]$Path) {
+    $s = Get-AuthenticodeSignature -LiteralPath $Path
+    $name = ''
+    if ($s.SignerCertificate) {
+        $name = $s.SignerCertificate.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
     }
-    Say "Installing $Label ..."
-    & winget install --id $Id -e --silent --accept-source-agreements --accept-package-agreements
+    return @([string]$s.Status, $name)
+}
+function Get-PythonInstaller([string]$Folder) {
+    # newest 3.13.x that has a Windows installer, from python.org itself
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $headers = @{ 'User-Agent' = 'vaultkit-installer' }
+    $listing = (Invoke-WebRequest -Uri 'https://www.python.org/ftp/python/' -UseBasicParsing -Headers $headers).Content
+    $found = [regex]::Matches($listing, 'href="(3\.13\.(\d+))/"') |
+        ForEach-Object { [pscustomobject]@{ Version = $_.Groups[1].Value; Patch = [int]$_.Groups[2].Value } } |
+        Sort-Object Patch -Descending
+    foreach ($v in $found) {
+        $url = "https://www.python.org/ftp/python/$($v.Version)/python-$($v.Version)-amd64.exe"
+        try { Invoke-WebRequest -Uri $url -Method Head -UseBasicParsing -Headers $headers | Out-Null } catch { continue }
+        $exe = Join-Path $Folder "python-$($v.Version)-amd64.exe"
+        Say "Downloading Python $($v.Version) from python.org ..."
+        Invoke-WebRequest -Uri $url -OutFile $exe -UseBasicParsing -Headers $headers
+        $status, $signer = Get-Signer $exe
+        if ($status -ne 'Valid' -or $signer -ne $PythonSigner) {
+            Remove-Item -LiteralPath $exe -Force -ErrorAction SilentlyContinue
+            Fail "STOPPED: that Python installer isn't signed by $PythonSigner (Windows says: $status, signed by '$signer'). Nothing was installed."
+        }
+        return $exe
+    }
+    Fail "Couldn't find a Python 3.13 installer on python.org. Install 64-bit Python 3.13 yourself, then run this again."
+}
+function Install-Python {
+    $folder = Join-Path ([IO.Path]::GetTempPath()) ("vaultkit-python-" + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $folder | Out-Null
+    try {
+        $exe = Get-PythonInstaller $folder
+        Say "Installing Python (just for you: no admin needed) ..."
+        $p = Start-Process -FilePath $exe -PassThru -ArgumentList '/quiet', 'InstallAllUsers=0',
+            'Include_launcher=1', 'InstallLauncherAllUsers=0', 'PrependPath=0', 'Include_test=0', 'Shortcuts=0'
+        $null = $p.Handle
+        $p.WaitForExit()
+        if ($p.ExitCode -ne 0) { Fail "The Python installer stopped (code $($p.ExitCode)). Nothing else was changed." }
+    } finally {
+        Remove-Item -LiteralPath $folder -Recurse -Force -ErrorAction SilentlyContinue
+    }
     Refresh-Path
+}
+
+if ($CheckDownloadsOnly) {
+    $folder = Join-Path ([IO.Path]::GetTempPath()) ("vaultkit-check-" + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $folder | Out-Null
+    try {
+        $exe = Get-PythonInstaller $folder
+        Say "OK: $(Split-Path $exe -Leaf) is signed by $PythonSigner."
+    } finally {
+        Remove-Item -LiteralPath $folder -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    exit 0
 }
 
 if (-not $SkipPrerequisites) {
     Say "Checking what's installed ..."
     if (-not $Python) {
         $Python = Find-Python
-        if (-not $Python) { Winget-Install 'Python.Python.3.13' 'Python 3.13 (64-bit)'; $Python = Find-Python }
+        if (-not $Python) { Install-Python; $Python = Find-Python }
         if (-not $Python) { Fail "Couldn't find 64-bit Python after installing it. Open a new PowerShell window and run this again." }
-    }
-    $cli = Join-Path $env:ProgramFiles 'KeePassXC\keepassxc-cli.exe'
-    if (-not (Test-Path -LiteralPath $cli)) { Winget-Install 'KeePassXCTeam.KeePassXC' 'KeePassXC' }
-    $kpDir = Join-Path $env:ProgramFiles 'KeePassXC'
-    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-    if (($userPath -split ';') -notcontains $kpDir) {
-        [Environment]::SetEnvironmentVariable('Path', (($userPath.TrimEnd(';') + ';' + $kpDir).TrimStart(';')), 'User')
-        Refresh-Path
     }
     Say "Installing the Python packages vaultkit uses ..."
     & $Python -m pip install --user --upgrade --disable-pip-version-check 'PySide6>=6.7' 'cryptography>=42'
@@ -138,9 +199,19 @@ except InvalidSignature:
     Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+# ---------------------------------------------------------------- KeePassXC
+$kpNote = ''
+if (-not $SkipPrerequisites) {
+    Say ""
+    Say "Setting up KeePassXC ..."
+    & $Python -I -B (Join-Path $App 'kpsetup.py') install
+    if ($LASTEXITCODE -ne 0) { $kpNote = "KeePassXC isn't fully set up yet: open vaultkit and press Setup to finish." }
+}
+
 Say ""
 Say "vaultkit $version is installed in $App and will keep itself up to date."
-Say "Put your vault in $VaultDir (copy main.kdbx from your main PC, or create one in KeePassXC)."
+Say "Put your vault in $VaultDir (copy main.kdbx from your main PC), or create one from vaultkit's unlock screen."
+if ($kpNote) { Write-Host $kpNote -ForegroundColor Yellow }
 if (-not $NoLaunch) {
     $pyw = Join-Path (Split-Path $Python -Parent) 'pythonw.exe'
     if (-not (Test-Path -LiteralPath $pyw)) { $pyw = $Python }

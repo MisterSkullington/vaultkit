@@ -11,11 +11,17 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import autostart  # noqa: E402
+import kpsetup  # noqa: E402
 import secretstore  # noqa: E402
 import shortcuts  # noqa: E402
 import updater  # noqa: E402
+import vaultkit as vk  # noqa: E402
 
 WINDOWS = os.name == "nt"
+# The real KeePassXC install runs only on GitHub's throwaway Windows machines: it installs
+# software for all users and registers the browser connection.
+REAL_INSTALL = WINDOWS and os.environ.get("VAULTKIT_REAL_KEEPASSXC") == "1" \
+    and os.environ.get("GITHUB_ACTIONS") == "true"
 
 
 @unittest.skipUnless(WINDOWS, "Windows only")
@@ -114,6 +120,92 @@ class RealInstaller(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("STOPPED", r.stdout)
         self.assertFalse((root / "app").exists())
+
+
+@unittest.skipUnless(WINDOWS, "Windows only")
+class RealKpsetupWindows(unittest.TestCase):
+    TEST_KEY = r"Software\vaultkit-ci-test\NativeMessagingHosts\org.keepassxc.keepassxc_browser"
+
+    def tearDown(self):
+        import winreg
+        parts = self.TEST_KEY.split("\\")
+        for n in range(len(parts), 1, -1):  # Software\vaultkit-ci-test\... deepest first
+            try:
+                winreg.DeleteKey(winreg.HKEY_CURRENT_USER, "\\".join(parts[:n]))
+            except OSError:
+                pass
+
+    def test_registry_and_connector(self):
+        reg = kpsetup._WinReg()
+        self.assertIsNone(reg.get(self.TEST_KEY, ""))
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch.dict(os.environ, {"LOCALAPPDATA": d}), \
+             mock.patch.object(kpsetup, "CHROME_KEY", self.TEST_KEY):
+            root = Path(d) / "KeePassXC-install"
+            root.mkdir()
+            for name in ("keepassxc-cli.exe", "keepassxc-proxy.exe"):
+                (root / name).write_text("x")
+            path = kpsetup.register_connector(root / "keepassxc-cli.exe")
+            self.assertEqual(reg.get(self.TEST_KEY, ""), str(path))  # the key's default value
+            self.assertIsNone(kpsetup.connector_problem())
+        reg.install_location()  # reads HKLM's uninstall list without raising
+
+    def test_windows_signature_check(self):
+        notepad = Path(os.environ["SystemRoot"]) / "System32" / "notepad.exe"
+        status, signer = kpsetup.authenticode(notepad)
+        self.assertEqual(status, "Valid")
+        self.assertIn("Microsoft", signer)
+        with self.assertRaises(kpsetup.SetupError):  # validly signed, but not by KeePassXC
+            kpsetup.check_signature(notepad)
+        with tempfile.TemporaryDirectory() as d:
+            fake = Path(d) / "KeePassXC-9.9.9-Win64.msi"
+            fake.write_bytes(b"not an installer")
+            self.assertNotEqual(kpsetup.authenticode(fake)[0], "Valid")
+
+    def test_tasklist(self):
+        self.assertIsInstance(kpsetup.keepassxc_running(), bool)
+
+
+@unittest.skipUnless(REAL_INSTALL, "real install: GitHub Actions with VAULTKIT_REAL_KEEPASSXC=1")
+class RealKeePassXC(unittest.TestCase):
+    """Download, verify and install the real KeePassXC; set it up; create a vault; open it."""
+
+    def test_install_setup_create_open(self):
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch.dict(os.environ, {"APPDATA": str(Path(d) / "roaming"),
+                                          "LOCALAPPDATA": str(Path(d) / "local")}):
+            cli = kpsetup.install_keepassxc(progress=print, quiet_ui=True)
+            ver = kpsetup.cli_version(cli)
+            print("installed:", cli, ver)
+            self.assertGreaterEqual(ver, kpsetup.MIN_VERSION)
+            self.assertTrue(kpsetup.gui_exe(cli).is_file())
+            with mock.patch.object(kpsetup.shutil, "which", return_value=None):
+                self.assertEqual(kpsetup.find_cli(), cli)  # no PATH needed
+
+            changed = kpsetup.apply_settings()
+            self.assertTrue(changed)
+            self.assertEqual(kpsetup.settings_to_change(), [])
+
+            vault = Path(d) / "vault" / "main.kdbx"
+            kpsetup.create_vault(cli, vault, "maple river lantern orbit")
+            info = kpsetup.vault_info(vault)
+            print("new vault:", info)
+            self.assertIn(info.kdf, ("AES-KDF", "Argon2d", "Argon2id"))
+            v = vk.Vault(db=str(vault), cli=str(cli))
+            v.set_secret("maple river lantern orbit")
+            v.verify()  # the real keepassxc-cli opens it with that password
+            checks = {c.key: c for c in kpsetup.run_checks(str(vault), cli=cli)}
+            self.assertTrue(checks["keepassxc"].ok)
+            self.assertTrue(checks["settings"].ok)
+
+    def test_python_installer_download_is_signed(self):
+        r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                            str(ROOT / "install.ps1"), "-PublicKey", "0" * 64,
+                            "-Root", tempfile.mkdtemp(), "-CheckDownloadsOnly"],
+                           capture_output=True, text=True, timeout=600)
+        print(r.stdout, r.stderr)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("is signed by Python Software Foundation", r.stdout)
 
 
 if __name__ == "__main__":

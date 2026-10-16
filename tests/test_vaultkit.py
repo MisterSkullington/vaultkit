@@ -7,6 +7,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE))
 import fake_hibp  # noqa: E402
+import kpsetup  # noqa: E402
 import vaultkit as vk  # noqa: E402
 
 FAKE = str(HERE / "fake_kpcli.py")
@@ -115,7 +116,7 @@ class EndToEnd(unittest.TestCase):
         self.hibp = fake_hibp.patch([fake_hibp.breach("github.com", "2020-01-01")])
         self.hibp.start()
         self.base = ["--db", "v.kdbx", "--password-cmd", PWCMD.format("m4ster")]
-        self.cli = mock.patch.object(vk.shutil, "which", return_value=None)
+        self.cli = mock.patch.object(kpsetup, "find_cli", return_value=None)
         self.cli.start()
 
     def tearDown(self):
