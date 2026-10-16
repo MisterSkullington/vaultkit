@@ -28,4 +28,25 @@ jobs:
       - name: Lint
         run: python -m pyflakes .
       - name: Tests
-        run: python -m unittest discover -s tests -v
+        shell: bash
+        run: |
+          python -m unittest discover -s tests -v 2>&1 | tee test-output.txt
+          exit ${PIPESTATUS[0]}
+      # Each failing test becomes an annotation (title + traceback tail), readable through
+      # the GitHub API without downloading the raw log.
+      - name: Report failures
+        if: failure()
+        shell: python
+        run: |
+          import re
+          text = open("test-output.txt", encoding="utf-8", errors="replace").read()
+          for block in re.split(r"\n={50,}\n", text)[1:]:
+              head, _, body = block.partition("\n" + "-" * 70 + "\n")
+              body = body.split("\n" + "-" * 70 + "\nRan ")[0].strip()[-2500:]
+              msg = body.replace("%", "%25").replace("\r", "").replace("\n", "%0A")
+              title = head.strip()[:180]
+              for a, b in (("%", "%25"), ("\r", "%0D"), ("\n", "%0A"), (":", "%3A"), (",", "%2C")):
+                  title = title.replace(a, b)
+              print(f"::error title={title}::{msg}")
+          tail = "%0A".join(text.strip().splitlines()[-3:])
+          print(f"::notice title=summary::{tail}")
