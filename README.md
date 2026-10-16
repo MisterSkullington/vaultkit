@@ -3,8 +3,9 @@
 [![tests](https://github.com/MisterSkullington/vaultkit/actions/workflows/tests.yml/badge.svg)](https://github.com/MisterSkullington/vaultkit/actions/workflows/tests.yml)
 
 KeePassXC is the vault: it stores your passwords, and its browser extension fills them in.
-vaultkit checks them (breached, weak, reused, near-identical, old, and sites that were
-breached), gives the vault a health score, and walks you through changing the bad ones.
+vaultkit installs and sets up KeePassXC the recommended way, checks your passwords (breached,
+weak, reused, near-identical, old, and sites that were breached), gives the vault a health
+score, and walks you through changing the bad ones.
 Everything runs on your PC. What leaves it: the first 5 characters of each password's SHA-1
 hash, to the free Pwned Passwords service (the match happens locally), and a once-a-day
 download of Have I Been Pwned's public list of breached websites, which is matched locally
@@ -36,13 +37,17 @@ tools/release.py    signs and publishes a release (run on your PC; the key stays
 vaultkit.py         the command-line tool (same core the app uses)
 vaultkit.cmd        lets you type `vaultkit ...` instead of `py vaultkit.py ...`
 secretstore.py      optional saved password for unattended checks (Windows DPAPI)
+kpsetup.py          finds, installs and sets up KeePassXC (also: py -3.13 kpsetup.py check)
 breaches.py         which of your sites had a breach, and was it after your last change
 strength.py         weak and near-identical password checks (nothing leaves the PC)
-tests/              85 tests, incl. headless GUI tests against a fake keepassxc-cli;
-                    run on real Windows by GitHub Actions on every push
+tests/              127 tests, incl. headless GUI tests against a fake keepassxc-cli;
+                    run on real Windows by GitHub Actions on every push, followed by a
+                    real KeePassXC download, signature check, install and vault test
 ```
 
-Needs: Windows 10/11, KeePassXC (with `C:\Program Files\KeePassXC` on PATH), Python 3.10+. The app needs **64-bit** Python (PySide6 has no 32-bit Windows build); the launcher uses `pyw -3.13`.
+Needs: Windows 10/11 and 64-bit Python 3.10+ (PySide6 has no 32-bit Windows build; the
+launcher uses `pyw -3.13`). KeePassXC is installed for you if it's missing (*Setup*, below),
+and it doesn't need to be on PATH.
 
 ---
 
@@ -56,7 +61,32 @@ py -3.13 -m pip install -r requirements.txt
 
 Then double-click **Open vaultkit.cmd**. Pin it to Start for quick access (right-click → Pin to Start).
 
-- **Unlock:** choose your `.kdbx`, type the master password. It's held in memory only.
+- **Unlock:** choose your `.kdbx`, type the master password. It's held in memory only. If
+  KeePassXC isn't installed, a notice offers **Set up KeePassXC**.
+- **Setup** (bottom left of the unlock screen, top bar of the dashboard): a list of green
+  ticks, with a button next to anything that isn't done:
+  - **KeePassXC:** installs the latest version from KeePassXC's official GitHub releases. Before
+    it runs, the download must match KeePassXC's published checksum **and** Windows must confirm
+    it's signed by *DroidMonkey Apps, LLC* (KeePassXC's signing company); otherwise nothing is
+    installed. One Windows permission prompt, which should name that publisher.
+  - **Recommended settings:** back up before each save, lock after 5 minutes and when Windows
+    locks, clear copied passwords after 10 s, Windows Hello unlock, tray icon, browser
+    integration, and giving logins to the browser without asking each time (the browser still
+    only gets logins for the site you're on). Only settings that differ are changed, and a
+    stricter choice of yours (say, locking after 2 minutes) is kept. KeePassXC must be closed,
+    because it rewrites its settings when it quits; the old file is backed up next to it.
+  - **Browser connection:** registers KeePassXC for Chrome-based browsers, Opera GX included,
+    exactly as KeePassXC's own *Chrome* checkbox does.
+  - **KeePassXC starts with Windows**, so auto-fill is ready when you log in.
+  - **Vault security:** reads your vault file's unencrypted header (no password needed) and
+    checks it uses KDBX 4, **Argon2id** and at least 256 MiB. If not, **Show me how** lists
+    the one KeePassXC screen that fixes it.
+  - **KeePassXC-Browser in Opera GX:** opens the extension's page. Adding it, pressing
+    *Connect* and naming the connection are yours to do: that handshake is the security boundary.
+- **Create a vault** (*No vault yet? Create one* on the unlock screen): choose where, type a
+  master password twice (12+ characters, no common patterns, not in known breaches), and tick
+  that it's written on paper. KeePassXC's command-line tool can only make an older-format vault
+  (KDBX 3.1, AES-KDF), so Setup then shows the one-minute switch to Argon2id + 256 MiB.
 - **Dashboard:** checks automatically after unlocking. Shows how many passwords need
   changing, a **health score** out of 100 with its trend over the last 30 days, a bar of
   breached / at risk / safe, and a list of each problem (see *What the check looks for*).
@@ -132,10 +162,13 @@ open the file, *Download raw file*) and run it from a normal PowerShell window:
 ```powershell
 powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\Downloads\install.ps1" -PublicKey PASTE_KEY_HERE
 ```
-It installs anything missing (64-bit Python, KeePassXC, the two Python packages), downloads
-your latest release, **checks its signature against your key before unpacking anything**, pins
-the key for future updates and starts vaultkit. Your vault isn't downloaded: copy `main.kdbx`
-into `vaultkit\vault` yourself. Only your main PC can publish releases.
+It doesn't need winget. It installs 64-bit Python from python.org if it's missing (just for
+you, no admin, only after Windows confirms the installer is signed by the Python Software
+Foundation) and the two Python packages, downloads your latest release, **checks its signature
+against your key before unpacking anything**, pins the key for future updates, then installs and
+sets up KeePassXC as *Setup* does, and starts vaultkit. Your vault isn't downloaded: copy
+`main.kdbx` into `vaultkit\vault` yourself, or create a new one. Only your main PC can publish
+releases.
 
 ## Uninstall
 
@@ -159,7 +192,9 @@ publish from it keeps your signing key.
 | `vaultkit rotate list` | Rotations started but not finished |
 | `vaultkit remember` / `vaultkit forget` | Save / delete the master password for unattended checks |
 | `vaultkit shred FILE` | Overwrite and delete an exported CSV |
-| `vaultkit --version` | Should say 1.8.0 |
+| `vaultkit --version` | Should say 1.9.0 |
+| `py -3.13 kpsetup.py check --db <vault>` | The Setup list, in text |
+| `py -3.13 kpsetup.py install` | Install KeePassXC if needed, then the recommended setup |
 
 `vaultkit` works from any PowerShell window once this folder is on your PATH (one time):
 ```powershell
@@ -244,6 +279,9 @@ only the app's code: no passwords, no vault, no settings. `.gitignore` blocks `*
 
 ## One-time setup (done once, for reference)
 
+*Setup* in the app now does the settings, browser connection and autostart parts of this, and
+checks the vault's encryption. The manual steps, for reference:
+
 **Vault:** KeePassXC → New Database → Advanced Settings: KDBX 4, **Argon2id**, 256 MiB, threads =
 CPU cores, ~1 s decryption. Settings → Security: lock after 300 s, lock with Windows, clear
 clipboard after 10 s, enable Windows Hello quick unlock. Settings → General: auto-save and
@@ -265,4 +303,7 @@ turn on auto-fill for single credentials and auto-submit.
   downloaded, that one check is skipped and the dashboard says so; everything else still runs.
 - Python can't wipe strings from memory; the master password lives in the app's memory until
   lock or exit. Auto-lock limits that window.
+- KeePassXC's own default for new vaults is Argon2d with 64 MiB; *Setup* flags that too.
+  Argon2d is fine for a file on your PC, but Argon2id with 256 MiB is the stronger, recommended
+  setting.
 - Run the tests: `py -m unittest discover -s tests`

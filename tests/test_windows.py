@@ -176,7 +176,7 @@ class RealKeePassXC(unittest.TestCase):
                                           "LOCALAPPDATA": str(Path(d) / "local")}):
             cli = kpsetup.install_keepassxc(progress=print, quiet_ui=True)
             ver = kpsetup.cli_version(cli)
-            print("installed:", cli, ver)
+            print(f"::notice title=KeePassXC installed::{kpsetup.version_text(ver)} at {cli}")
             self.assertGreaterEqual(ver, kpsetup.MIN_VERSION)
             self.assertTrue(kpsetup.gui_exe(cli).is_file())
             with mock.patch.object(kpsetup.shutil, "which", return_value=None):
@@ -189,7 +189,8 @@ class RealKeePassXC(unittest.TestCase):
             vault = Path(d) / "vault" / "main.kdbx"
             kpsetup.create_vault(cli, vault, "maple river lantern orbit")
             info = kpsetup.vault_info(vault)
-            print("new vault:", info)
+            print(f"::notice title=keepassxc-cli db-create made::{info.summary()} "
+                  f"(cipher {info.cipher}, AES rounds {info.rounds})")
             self.assertIn(info.kdf, ("AES-KDF", "Argon2d", "Argon2id"))
             v = vk.Vault(db=str(vault), cli=str(cli))
             v.set_secret("maple river lantern orbit")
@@ -204,6 +205,9 @@ class RealKeePassXC(unittest.TestCase):
                             "-Root", tempfile.mkdtemp(), "-CheckDownloadsOnly"],
                            capture_output=True, text=True, timeout=600)
         print(r.stdout, r.stderr)
+        ok = [line for line in r.stdout.splitlines() if line.startswith("OK:")]
+        if ok:
+            print(f"::notice title=python.org installer::{ok[0]}")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("is signed by Python Software Foundation", r.stdout)
 
